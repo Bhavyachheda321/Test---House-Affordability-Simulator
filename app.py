@@ -154,12 +154,12 @@ def simulate_portfolio(params, asset_classes):
             if not ac.get("invest_above_surplus", False):
                 sip_subject_to_limit += annual_sip
                 
-        # 1. Flag budget status conditions
-        sip_budget_over = sip_subject_to_limit > surplus_yr
-        sip_budget_under = sip_subject_to_limit < surplus_yr
-
-        # 2. Allocate uninvested surplus cash flow
-        uninvested_surplus = max(0.0, surplus_yr - sip_subject_to_limit)
+        # Calculate exact differences for warnings
+        shortfall_amt = max(0.0, sip_subject_to_limit - surplus_yr)
+        excess_amt = max(0.0, surplus_yr - sip_subject_to_limit)
+        
+        # Allocate uninvested surplus cash flow
+        uninvested_surplus = excess_amt
         surplus_alloc_in = [0.0] * n
         
         if uninvested_surplus > 0:
@@ -167,10 +167,8 @@ def simulate_portfolio(params, asset_classes):
             total_alloc = sum(alloc_pcts)
             
             if total_alloc > 0:
-                # Distribute uninvested surplus to asset classes proportionally
                 surplus_alloc_in = [(uninvested_surplus * (p / total_alloc)) for p in alloc_pcts]
             else:
-                # No allocation setup; surplus stays in non-earning Cash pool
                 cash_accumulated += uninvested_surplus
 
         return_on_open = sum(asset_balances[i] * ac["annual_return"] for i, ac in enumerate(asset_classes))
@@ -180,14 +178,12 @@ def simulate_portfolio(params, asset_classes):
             cap_r = ac["annual_return"] - (max(0.0, ac.get("income_yield_pct", 0.0)) / 100.0)
             tf = TIMING_FACTORS.get(ac.get("contribution_timing", "monthly"), TIMING_FACTORS["monthly"])
             
-            # Balance updates with scheduled SIP + Reinvestments + Extra Allocated Surplus Cash
             total_added = sip_yr[i] + surplus_alloc_in[i]
             new_bals.append(asset_balances[i] * (1 + cap_r) + (total_added + reinvest_inflow[i]) * tf(cap_r))
             
         opening_portfolio = sum(asset_balances)
         asset_balances = new_bals
         
-        # Portfolio Value includes both asset growth and unallocated static cash
         total_portfolio_value = sum(asset_balances) + cash_accumulated
         
         series.append({
@@ -195,15 +191,16 @@ def simulate_portfolio(params, asset_classes):
             'gross_monthly': gross_monthly, 'take_home_monthly': th_monthly, 'expense_monthly': exp_monthly,
             'rent_monthly': rent_monthly, 'surplus_yr': surplus_yr, 'req_liquid': req_liquid,
             'tax_info': tax_info, 'slab_scale': slab_scale, 
-            'sip_budget_over': sip_budget_over, 'sip_budget_under': sip_budget_under
+            'shortfall_amt': shortfall_amt, 'excess_amt': excess_amt
         })
     return series
 
 def run_affordability(params, asset_classes):
     series = simulate_portfolio(params, asset_classes)
     res = []
-    has_over_warning = False
-    has_under_warning = False
+    
+    over_details = []
+    under_details = []
     
     for t, ps in enumerate(series):
         age = params['age'] + t
@@ -211,8 +208,11 @@ def run_affordability(params, asset_classes):
         v_t = ps['portfolio_value']
         outlay = h_t * (1 + params['tx_cost'])
         
-        if ps['sip_budget_over']: has_over_warning = True
-        if ps['sip_budget_under']: has_under_warning = True
+        # Track exact deficit/excess amounts per year
+        if ps['shortfall_amt'] > 0:
+            over_details.append((age, ps['shortfall_amt']))
+        if ps['excess_amt'] > 0:
+            under_details.append((age, ps['excess_amt']))
         
         max_loan_t = 0.0
         emi_aff_net = 0.0
@@ -243,7 +243,7 @@ def run_affordability(params, asset_classes):
             'Affordable': "YES ✓" if affordable else "No"
         })
         
-    return res, has_over_warning, has_under_warning
+    return res, over_details, under_details
 
 # =============================================================================
 # 3. STREAMLIT USER INTERFACE
@@ -383,7 +383,7 @@ with tab4:
     }
     
     if st.button("▶ Run Simulation", type="primary"):
-        results, has_over_warning, has_under_warning = run_affordability(params, asset_classes)
+        results, over_details, under_details = run_affordability(params, asset_classes)
         df_res = pd.DataFrame(results)
         
         format_dict = {
@@ -398,12 +398,20 @@ with tab4:
         with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
             df_res.to_excel(writer, sheet_name='Simulation Results', index=False)
         
-        # Display relevant dynamic warning banners based on simulation parameters
-        if has_over_warning:
-            st.error("⚠️ **Budget Deficit Warning:** In one or more years, your scheduled standard `monthly_contribution` targets exceed your available `Surplus/yr`. Either lower your contributions, reduce expenses, or check the 'Invest above Surplus Cash' box if those funds are coming from external sources.")
+        # Display Dynamic Warning Banners with Specific Years and Amounts
+        if over_details:
+            over_msg = "⚠️ **Budget Deficit Warning:** Your scheduled contributions exceed your available Surplus in the following years:\n\n"
+            for age_val, amt in over_details:
+                over_msg += f"- **Age {age_val}:** Shortfall of ₹{amt:,.0f}\n"
+            over_msg += "\n*Either lower your contributions, reduce expenses, or check 'Invest above Surplus Cash' if funding comes from external sources.*"
+            st.error(over_msg)
         
-        if has_under_warning:
-            st.warning("ℹ️ **Unallocated Surplus Notice:** In one or more years, your planned standard SIP contributions are less than your generated `Surplus/yr`. Leftover surplus has been automatically reinvested via your 'Surplus Allocation Percentage' definitions or moved to the unallocated static Cash bucket.")
+        if under_details:
+            under_msg = "ℹ️ **Unallocated Surplus Notice:** Your Surplus is greater than your planned SIPs in the following years:\n\n"
+            for age_val, amt in under_details:
+                under_msg += f"- **Age {age_val}:** Uninvested Surplus of ₹{amt:,.0f}\n"
+            under_msg += "\n*This leftover cash has been automatically reinvested via your 'Surplus Allocation Percentage' or moved to the unallocated static Cash bucket.*"
+            st.warning(under_msg)
 
         col_msg, col_btn = st.columns([2, 1])
         with col_msg:
