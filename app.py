@@ -107,11 +107,9 @@ TIMING_FACTORS = {'start': lambda r: (1 + r), 'mid': lambda r: (1 + r) ** 0.5, '
 
 def simulate_portfolio(params, asset_classes):
     series, n = [], len(asset_classes)
-    alloc_pcts = [max(0.0, ac.get("surplus_alloc_pct", 0.0)) for ac in asset_classes]
-    total_alloc = sum(alloc_pcts)
-    alloc_fracs = [p / total_alloc for p in alloc_pcts] if total_alloc > 0 else ([1.0 / n] * n if n > 0 else [])
     
     asset_balances = [ac["initial_value"] for ac in asset_classes]
+    cash_accumulated = 0.0  # Accumulates unallocated surplus cash earning 0% return
 
     for t in range(params['max_years'] + 1):
         gross_monthly = params['income_0'] * ((1 + params['inc_growth']) ** t)
@@ -142,43 +140,79 @@ def simulate_portfolio(params, asset_classes):
             apt_income.append(inc_tax["post_tax"])
             
         reinvest_inflow = apt_income 
-        surplus_in = [surplus_yr * f for f in alloc_fracs]
         
+        # Determine explicit SIPs
         sip_yr = []
+        sip_subject_to_limit = 0.0
+        
         for ac in asset_classes:
-            bm = ac.get("annual_contribution", 0.0)
-            mt = bm * ((1 + ac.get("stepup_value", 0.0) / 100.0) ** t) if ac.get("stepup_type", "pct") == "pct" else bm + ac.get("stepup_value", 0.0) * t
-            sip_yr.append(max(0.0, mt * 12))
+            monthly_base = ac.get("monthly_contribution", 0.0)
+            monthly_current = monthly_base * ((1 + ac.get("stepup_value", 0.0) / 100.0) ** t) if ac.get("stepup_type", "pct") == "pct" else monthly_base + ac.get("stepup_value", 0.0) * t
+            annual_sip = max(0.0, monthly_current * 12)
+            sip_yr.append(annual_sip)
+            
+            if not ac.get("invest_above_surplus", False):
+                sip_subject_to_limit += annual_sip
+                
+        # 1. Flag budget status conditions
+        sip_budget_over = sip_subject_to_limit > surplus_yr
+        sip_budget_under = sip_subject_to_limit < surplus_yr
 
-        tot_sip = sum(sip_yr)
+        # 2. Allocate uninvested surplus cash flow
+        uninvested_surplus = max(0.0, surplus_yr - sip_subject_to_limit)
+        surplus_alloc_in = [0.0] * n
+        
+        if uninvested_surplus > 0:
+            alloc_pcts = [max(0.0, ac.get("surplus_alloc_pct", 0.0)) for ac in asset_classes]
+            total_alloc = sum(alloc_pcts)
+            
+            if total_alloc > 0:
+                # Distribute uninvested surplus to asset classes proportionally
+                surplus_alloc_in = [(uninvested_surplus * (p / total_alloc)) for p in alloc_pcts]
+            else:
+                # No allocation setup; surplus stays in non-earning Cash pool
+                cash_accumulated += uninvested_surplus
+
         return_on_open = sum(asset_balances[i] * ac["annual_return"] for i, ac in enumerate(asset_classes))
         
         new_bals = []
         for i, ac in enumerate(asset_classes):
             cap_r = ac["annual_return"] - (max(0.0, ac.get("income_yield_pct", 0.0)) / 100.0)
             tf = TIMING_FACTORS.get(ac.get("contribution_timing", "monthly"), TIMING_FACTORS["monthly"])
-            new_bals.append(asset_balances[i] * (1 + cap_r) + (sip_yr[i] + reinvest_inflow[i] + surplus_in[i]) * tf(cap_r))
+            
+            # Balance updates with scheduled SIP + Reinvestments + Extra Allocated Surplus Cash
+            total_added = sip_yr[i] + surplus_alloc_in[i]
+            new_bals.append(asset_balances[i] * (1 + cap_r) + (total_added + reinvest_inflow[i]) * tf(cap_r))
             
         opening_portfolio = sum(asset_balances)
         asset_balances = new_bals
         
+        # Portfolio Value includes both asset growth and unallocated static cash
+        total_portfolio_value = sum(asset_balances) + cash_accumulated
+        
         series.append({
-            'year': t, 'portfolio_value': sum(asset_balances), 'opening_portfolio': opening_portfolio,
+            'year': t, 'portfolio_value': total_portfolio_value, 'opening_portfolio': opening_portfolio,
             'gross_monthly': gross_monthly, 'take_home_monthly': th_monthly, 'expense_monthly': exp_monthly,
             'rent_monthly': rent_monthly, 'surplus_yr': surplus_yr, 'req_liquid': req_liquid,
-            'tax_info': tax_info, 'slab_scale': slab_scale
+            'tax_info': tax_info, 'slab_scale': slab_scale, 
+            'sip_budget_over': sip_budget_over, 'sip_budget_under': sip_budget_under
         })
     return series
 
 def run_affordability(params, asset_classes):
     series = simulate_portfolio(params, asset_classes)
     res = []
+    has_over_warning = False
+    has_under_warning = False
     
     for t, ps in enumerate(series):
         age = params['age'] + t
         h_t = house_price_in_year(params['house_price'], params['house_infl'], t)
         v_t = ps['portfolio_value']
         outlay = h_t * (1 + params['tx_cost'])
+        
+        if ps['sip_budget_over']: has_over_warning = True
+        if ps['sip_budget_under']: has_under_warning = True
         
         max_loan_t = 0.0
         emi_aff_net = 0.0
@@ -208,7 +242,8 @@ def run_affordability(params, asset_classes):
             'EffEMI': actual_emi, 'AffEMI': emi_aff_net, 'Tax%': ps['tax_info']['effective_rate'] * 100, 
             'Affordable': "YES ✓" if affordable else "No"
         })
-    return res
+        
+    return res, has_over_warning, has_under_warning
 
 # =============================================================================
 # 3. STREAMLIT USER INTERFACE
@@ -271,7 +306,6 @@ with tab3:
     st.subheader("Investment Accounts / Assets")
     st.info("Edit the table below to add or modify your current assets and SIPs.")
     
-    # 1. Renamed Headers
     default_assets = pd.DataFrame([{
         "Asset_Class": "Savings/Equity", 
         "Opening_Value": 0.0, 
@@ -280,9 +314,9 @@ with tab3:
         "Stepup_type": "Percentage", 
         "Stepup_Value": 0.0, 
         "Surplus_Allocation_Percentage": 100.0,
+        "Invest_above_Surplus_Cash": False
     }])
     
-    # 2. Configured Dropdown for Stepup_type
     edited_assets_df = st.data_editor(
         default_assets, 
         num_rows="dynamic", 
@@ -293,22 +327,26 @@ with tab3:
                 help="Choose how the step-up applies (Percentage or Fixed amount)",
                 options=["Percentage", "Fixed"],
                 required=True
+            ),
+            "Invest_above_Surplus_Cash": st.column_config.CheckboxColumn(
+                "Invest above Surplus Cash",
+                help="Check this if this asset is funded externally (e.g. Employer PF match) and shouldn't count against your standard monthly budget.",
+                default=False
             )
         }
     )
     
-    # Convert back to engine format (mapping frontend names to backend requirements)
     asset_classes = []
     for _, row in edited_assets_df.iterrows():
         asset_classes.append({
             "name": row.get("Asset_Class", "Asset"),
             "initial_value": row.get("Opening_Value", 0.0),
-            # Multiply monthly contribution by 12 as the engine expects annual
-            "annual_contribution": row.get("monthly_contribution", 0.0) * 12,
+            "monthly_contribution": row.get("monthly_contribution", 0.0),
             "annual_return": row.get("Annual Return", 0.0) / 100.0,
             "stepup_type": "pct" if row.get("Stepup_type") == "Percentage" else "fixed",
             "stepup_value": row.get("Stepup_Value", 0.0),
-            "surplus_alloc_pct": row.get("Surplus_Allocation_Percentage", 0.0)
+            "surplus_alloc_pct": row.get("Surplus_Allocation_Percentage", 0.0),
+            "invest_above_surplus": row.get("Invest_above_Surplus_Cash", False)
         })
 
     st.markdown("---")
@@ -345,7 +383,7 @@ with tab4:
     }
     
     if st.button("▶ Run Simulation", type="primary"):
-        results = run_affordability(params, asset_classes)
+        results, has_over_warning, has_under_warning = run_affordability(params, asset_classes)
         df_res = pd.DataFrame(results)
         
         format_dict = {
@@ -356,12 +394,17 @@ with tab4:
         
         affordable_rows = df_res[df_res['Affordable'] == "YES ✓"]
         
-        # 3. Create Excel Buffer for Download
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
             df_res.to_excel(writer, sheet_name='Simulation Results', index=False)
         
-        # Display Success/Error Message and Download Button Side-by-Side
+        # Display relevant dynamic warning banners based on simulation parameters
+        if has_over_warning:
+            st.error("⚠️ **Budget Deficit Warning:** In one or more years, your scheduled standard `monthly_contribution` targets exceed your available `Surplus/yr`. Either lower your contributions, reduce expenses, or check the 'Invest above Surplus Cash' box if those funds are coming from external sources.")
+        
+        if has_under_warning:
+            st.warning("ℹ️ **Unallocated Surplus Notice:** In one or more years, your planned standard SIP contributions are less than your generated `Surplus/yr`. Leftover surplus has been automatically reinvested via your 'Surplus Allocation Percentage' definitions or moved to the unallocated static Cash bucket.")
+
         col_msg, col_btn = st.columns([2, 1])
         with col_msg:
             if not affordable_rows.empty:
