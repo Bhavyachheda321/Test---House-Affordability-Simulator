@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import math
+import io
 
 # =============================================================================
 # 1. FINANCIAL MATH & TAX MODULE (Preserved from original logic)
@@ -100,7 +101,7 @@ def compute_asset_income_tax(gross_income, tax_mode, fixed_rate_pct, slab_effect
 
 
 # =============================================================================
-# 2. PORTFOLIO & AFFORDABILITY ENGINE (Core untouched)
+# 2. PORTFOLIO & AFFORDABILITY ENGINE
 # =============================================================================
 TIMING_FACTORS = {'start': lambda r: (1 + r), 'mid': lambda r: (1 + r) ** 0.5, 'end': lambda r: 1.0, 'monthly': lambda r: (1 + r) ** 0.5}
 
@@ -140,7 +141,7 @@ def simulate_portfolio(params, asset_classes):
             ag_income.append(inc_tax["gross"])
             apt_income.append(inc_tax["post_tax"])
             
-        reinvest_inflow = apt_income # Assuming 100% reinvest back to same asset for simplicity in web UI
+        reinvest_inflow = apt_income 
         surplus_in = [surplus_yr * f for f in alloc_fracs]
         
         sip_yr = []
@@ -270,16 +271,45 @@ with tab3:
     st.subheader("Investment Accounts / Assets")
     st.info("Edit the table below to add or modify your current assets and SIPs.")
     
+    # 1. Renamed Headers
     default_assets = pd.DataFrame([{
-        "name": "Savings/Equity", "initial_value": 0.0, "annual_contribution": 0.0,
-        "annual_return": 10.0, "stepup_type": "pct", "stepup_value": 0.0, "surplus_alloc_pct": 100.0,
+        "Asset_Class": "Savings/Equity", 
+        "Opening_Value": 0.0, 
+        "monthly_contribution": 0.0,
+        "Annual Return": 10.0, 
+        "Stepup_type": "Percentage", 
+        "Stepup_Value": 0.0, 
+        "Surplus_Allocation_Percentage": 100.0,
     }])
     
-    edited_assets_df = st.data_editor(default_assets, num_rows="dynamic", use_container_width=True)
-    # Convert back to dict and normalize returns
-    asset_classes = edited_assets_df.to_dict(orient="records")
-    for ac in asset_classes:
-        ac['annual_return'] /= 100.0  # Convert % input to decimal for engine
+    # 2. Configured Dropdown for Stepup_type
+    edited_assets_df = st.data_editor(
+        default_assets, 
+        num_rows="dynamic", 
+        use_container_width=True,
+        column_config={
+            "Stepup_type": st.column_config.SelectboxColumn(
+                "Stepup_type",
+                help="Choose how the step-up applies (Percentage or Fixed amount)",
+                options=["Percentage", "Fixed"],
+                required=True
+            )
+        }
+    )
+    
+    # Convert back to engine format (mapping frontend names to backend requirements)
+    asset_classes = []
+    for _, row in edited_assets_df.iterrows():
+        asset_classes.append({
+            "name": row.get("Asset_Class", "Asset"),
+            "initial_value": row.get("Opening_Value", 0.0),
+            # Multiply monthly contribution by 12 as the engine expects annual
+            "annual_contribution": row.get("monthly_contribution", 0.0) * 12,
+            "annual_return": row.get("Annual Return", 0.0) / 100.0,
+            "stepup_type": "pct" if row.get("Stepup_type") == "Percentage" else "fixed",
+            "stepup_value": row.get("Stepup_Value", 0.0),
+            "surplus_alloc_pct": row.get("Surplus_Allocation_Percentage", 0.0)
+        })
 
     st.markdown("---")
     st.subheader("Home Loan Constraints")
@@ -301,7 +331,6 @@ with tab3:
 with tab4:
     st.subheader("Simulation Results")
     
-    # Pack parameters for engine
     params = {
         'age': age, 'max_years': max_age - age, 'house_price': house_price, 'house_infl': house_infl,
         'tx_cost': tx_cost, 'cash_buf': cash_buf, 'buf_infl': buf_infl, 'income_0': income_0, 
@@ -319,7 +348,6 @@ with tab4:
         results = run_affordability(params, asset_classes)
         df_res = pd.DataFrame(results)
         
-        # Format the dataframe columns for better readability
         format_dict = {
             'TakeHome/mo': '₹{:,.0f}', 'Surplus/yr': '₹{:,.0f}', 'Portfolio': '₹{:,.0f}',
             'HousePrice': '₹{:,.0f}', 'MaxLoan': '₹{:,.0f}', 'CashLeft': '₹{:,.0f}',
@@ -327,10 +355,28 @@ with tab4:
         }
         
         affordable_rows = df_res[df_res['Affordable'] == "YES ✓"]
-        if not affordable_rows.empty:
-            earliest_age = affordable_rows.iloc[0]['Age']
-            st.success(f"### 🎉 Earliest Affordable Age: {earliest_age}")
-        else:
-            st.error(f"### ❌ Not affordable by age {max_age}")
+        
+        # 3. Create Excel Buffer for Download
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+            df_res.to_excel(writer, sheet_name='Simulation Results', index=False)
+        
+        # Display Success/Error Message and Download Button Side-by-Side
+        col_msg, col_btn = st.columns([2, 1])
+        with col_msg:
+            if not affordable_rows.empty:
+                earliest_age = affordable_rows.iloc[0]['Age']
+                st.success(f"### 🎉 Earliest Affordable Age: {earliest_age}")
+            else:
+                st.error(f"### ❌ Not affordable by age {max_age}")
+                
+        with col_btn:
+            st.download_button(
+                label="📥 Download Detailed Excel",
+                data=excel_buffer.getvalue(),
+                file_name="house_affordability_results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
             
         st.dataframe(df_res.style.format(format_dict), use_container_width=True, height=600)
