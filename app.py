@@ -422,4 +422,79 @@ with tab4:
     params = {
         'age': st.session_state.age, 'max_years': st.session_state.max_age - st.session_state.age, 
         'house_price': st.session_state.house_price, 'house_infl': st.session_state.house_infl / 100.0,
-        'tx_cost': st.session_state.tx_cost / 100.0, 'cash_buf': st.session_
+        'tx_cost': st.session_state.tx_cost / 100.0, 'cash_buf': st.session_state.cash_buf, 
+        'buf_infl': st.session_state.buf_infl / 100.0, 'income_0': st.session_state.income_0, 
+        'net_0': st.session_state.net_0, 'inc_growth': st.session_state.inc_growth / 100.0, 
+        'tax_regime': st.session_state.tax_regime, 'basic_m': st.session_state.basic_m, 
+        'hra_m': st.session_state.hra_m, 'metro': st.session_state.metro, 
+        'bonus_0': st.session_state.bonus_0, 'bonus_mode': st.session_state.bonus_mode, 
+        'bonus_gross': st.session_state.bonus_gross, 'bonus_gr': st.session_state.bonus_gr / 100.0, 
+        'bonus_sav_pct': st.session_state.bonus_sav_pct, 'other_80c': st.session_state.other_80c, 
+        'nps_ann': st.session_state.nps_ann, 'nps_pct': st.session_state.nps_pct, 
+        'slab_infl': st.session_state.slab_infl / 100.0, 'exp_mode': st.session_state.exp_mode, 
+        'exp_frac': st.session_state.exp_frac / 100.0, 'exp_abs': st.session_state.exp_abs, 
+        'exp_infl': st.session_state.exp_infl / 100.0, 'rent_0': st.session_state.rent_0, 
+        'rent_infl': st.session_state.rent_infl / 100.0, 'loan_enabled': st.session_state.loan_enabled, 
+        'loan_rate': st.session_state.loan_rate / 100.0, 'loan_tenure': st.session_state.loan_tenure,
+        'bank_mult': st.session_state.bank_mult, 'emi_mode': st.session_state.emi_mode, 
+        'emi_frac': st.session_state.emi_frac / 100.0, 'emi_fixed': st.session_state.emi_fixed,
+        'emi_buf': st.session_state.emi_buf / 100.0, 'user_max_loan': st.session_state.user_max_loan
+    }  # <--- MAKE SURE THIS CLOSING BRACE IS HERE
+    
+    if st.button("▶ Run Simulation", type="primary"):
+        results, over_details, under_details = run_affordability(params, asset_classes)
+        df_res = pd.DataFrame(results)
+        
+        format_dict = {
+            'TakeHome/mo': '₹{:,.0f}', 'Surplus/yr': '₹{:,.0f}', 'Portfolio': '₹{:,.0f}',
+            'HousePrice': '₹{:,.0f}', 'MaxLoan': '₹{:,.0f}', 'CashLeft': '₹{:,.0f}',
+            'EffEMI': '₹{:,.0f}', 'AffEMI': '₹{:,.0f}', 'Tax%': '{:.1f}%', 'Eff_Return%': '{:.1f}%'
+        }
+        
+        affordable_rows = df_res[df_res['Affordable'] == "YES ✓"]
+        
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+            df_res.to_excel(writer, sheet_name='Simulation Results', index=False)
+        
+        if over_details:
+            over_msg = "⚠️ **Budget Deficit Warning:** Your scheduled contributions exceed your available Surplus in the following years:\n\n"
+            for age_val, amt in over_details:
+                over_msg += f"- **Age {age_val}:** Shortfall of ₹{amt:,.0f}\n"
+            over_msg += "\n*Either lower your contributions, reduce expenses, or check 'Invest above Surplus Cash' if funding comes from external sources.*"
+            st.error(over_msg)
+        
+        if under_details:
+            under_msg = "ℹ️ **Unallocated Surplus Notice:** Your Surplus is greater than your planned SIPs in the following years:\n\n"
+            for age_val, amt in under_details:
+                under_msg += f"- **Age {age_val}:** Uninvested Surplus of ₹{amt:,.0f}\n"
+            under_msg += "\n*This leftover cash has been routed to the unallocated static Cash bucket. Allocate 100% of your Surplus in the Assets tab to suppress this warning.*"
+            st.warning(under_msg)
+
+        col_msg, col_btn = st.columns([2, 1])
+        with col_msg:
+            if not affordable_rows.empty:
+                earliest_age = affordable_rows.iloc[0]['Age']
+                st.success(f"### 🎉 Earliest Affordable Age: {earliest_age}")
+            else:
+                st.error(f"### ❌ Not affordable by age {st.session_state.max_age}")
+                
+        with col_btn:
+            st.download_button(
+                label="📥 Download Detailed Excel",
+                data=excel_buffer.getvalue(),
+                file_name="house_affordability_results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                help="What: Downloads the full year-by-year dataset.\nHow: Click to download.\nExample: house_affordability_results.xlsx"
+            )
+            
+        # Extract breakdown strings to build hover tooltips for the Portfolio column
+        df_display = df_res.drop(columns=['Breakdown'])
+        df_tooltips = pd.DataFrame('', index=df_display.index, columns=df_display.columns)
+        df_tooltips['Portfolio'] = df_res['Breakdown']
+        
+        # Apply tooltips via pandas styler natively supported by st.dataframe
+        styled_df = df_display.style.format(format_dict).set_tooltips(df_tooltips)
+        
+        st.dataframe(styled_df, use_container_width=True, height=600)
