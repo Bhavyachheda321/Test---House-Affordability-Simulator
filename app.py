@@ -489,12 +489,26 @@ with tab4:
                 help="What: Downloads the full year-by-year dataset.\nHow: Click to download.\nExample: house_affordability_results.xlsx"
             )
             
-        # Extract breakdown strings to build hover tooltips for the Portfolio column
-        df_display = df_res.drop(columns=['Breakdown'])
-        df_tooltips = pd.DataFrame('', index=df_display.index, columns=df_display.columns)
-        df_tooltips['Portfolio'] = df_res['Breakdown']
+        # --- FIXED DATAFRAME RENDERING ---
+        # Rename the Breakdown column for a cleaner UI header
+        df_display = df_res.rename(columns={'Breakdown': 'Portfolio_Breakdown'})
         
-        # Apply tooltips via pandas styler natively supported by st.dataframe
-        styled_df = df_display.style.format(format_dict).set_tooltips(df_tooltips)
+        # Replace newlines with a clean separator so it fits perfectly in a single table cell
+        df_display['Portfolio_Breakdown'] = df_display['Portfolio_Breakdown'].str.replace(' \n ', '  |  ')
         
-        st.dataframe(styled_df, use_container_width=True, height=600)
+        # Apply the standard currency and percentage formatting
+        styled_df = df_display.style.format(format_dict)
+        
+        # Render the dataframe using Streamlit's native column configuration
+        st.dataframe(
+            styled_df, 
+            use_container_width=True, 
+            height=600,
+            column_config={
+                "Portfolio_Breakdown": st.column_config.TextColumn(
+                    "Portfolio Breakdown",
+                    help="Exact asset balances making up your total Portfolio for this year.",
+                    width="large"
+                )
+            }
+        )
