@@ -30,20 +30,18 @@ if 'assets_data' not in st.session_state:
     st.session_state['assets_data'] = [{
         "Asset_Class": "Savings/Equity", "Opening_Value": 0.0, "monthly_contribution": 0.0,
         "Annual Return": 10.0, "Stepup_type": "Percentage", "Stepup_Value": 0.0, 
-        "Surplus_Allocation_Percentage": 100.0, "Invest_above_Surplus_Cash": False
+        "Surplus_Allocation_Percentage": 100.0, "Invest_above_Surplus_Cash": False,
+        "Tax_Treatment": "Exempt", "Fixed_Tax_Pct": 0.0
     }]
 
-# Helper to handle file uploads
 def handle_scenario_upload():
     uploaded_file = st.session_state.get("scenario_uploader")
     if uploaded_file is not None:
         try:
             data = json.load(uploaded_file)
-            # Update params
             for k, v in data.get("params", {}).items():
                 if k in st.session_state:
                     st.session_state[k] = v
-            # Update assets
             if "assets" in data:
                 st.session_state['assets_data'] = data["assets"]
             st.success("Scenario loaded successfully!")
@@ -51,7 +49,7 @@ def handle_scenario_upload():
             st.error(f"Error loading scenario: {e}")
 
 # =============================================================================
-# 1. FINANCIAL MATH & TAX MODULE (Preserved from original logic)
+# 1. FINANCIAL MATH & TAX MODULE
 # =============================================================================
 
 NEW_REGIME_SLABS = [(400_000, 0.00), (800_000, 0.05), (1_200_000, 0.10), (1_600_000, 0.15), (2_000_000, 0.20), (2_400_000, 0.25), (float('inf'), 0.30)]
@@ -118,15 +116,8 @@ def compute_annual_tax(annual_gross, tax_regime, home_loan_interest_paid=0.0, ho
     return {
         'gross_income': annual_gross, 'taxable_income': taxable_income, 'total_tax': total_tax,
         'take_home_annual': annual_gross - total_tax, 'take_home_monthly': (annual_gross - total_tax) / 12,
-        'effective_rate': (total_tax / annual_gross) if annual_gross > 0 else 0
+        'effective_rate': (total_tax / annual_gross) if annual_gross > 0 else 0.0
     }
-
-def compute_asset_income_tax(gross_income, tax_mode, fixed_rate_pct, slab_effective_rate):
-    if gross_income <= 0: return {'gross': 0.0, 'tax': 0.0, 'post_tax': 0.0}
-    rate = max(0.0, min(1.0, fixed_rate_pct / 100.0)) if tax_mode == "fixed" else slab_effective_rate
-    tax = gross_income * rate
-    return {'gross': gross_income, 'tax': tax, 'post_tax': gross_income - tax}
-
 
 # =============================================================================
 # 2. PORTFOLIO & AFFORDABILITY ENGINE
@@ -140,32 +131,35 @@ def simulate_portfolio(params, asset_classes):
 
     for t in range(params['max_years'] + 1):
         gross_monthly = params['income_0'] * ((1 + params['inc_growth']) ** t)
+        gross_annual = gross_monthly * 12
         rent_monthly = params['rent_0'] * ((1 + params['rent_infl']) ** t)
         slab_scale = (1 + params['slab_infl']) ** t
         
+        # Standard Salary Tax
         tax_info = compute_annual_tax(
-            annual_gross=gross_monthly * 12, tax_regime=params['tax_regime'], other_80c_investments=params['other_80c'],
+            annual_gross=gross_annual, tax_regime=params['tax_regime'], other_80c_investments=params['other_80c'],
             basic_monthly=params['basic_m'], hra_received_monthly=params['hra_m'], rent_paid_monthly=rent_monthly,
             metro_city=params['metro'], employer_nps_annual=params['nps_ann'], nps_pct_of_basic=params['nps_pct'], slab_scale_factor=slab_scale
         )
         
+        # Dynamic Asset Tax Blending (Recalculate Effective Rate with Slab Assets)
+        slab_asset_income = sum((asset_balances[i] * ac['annual_return']) for i, ac in enumerate(asset_classes) if ac['tax_treatment'] == 'Taxed at slab rate')
+        
+        if slab_asset_income > 0:
+            revised_tax_info = compute_annual_tax(gross_annual + slab_asset_income, tax_regime=params['tax_regime'], other_80c_investments=params['other_80c'], basic_monthly=params['basic_m'], hra_received_monthly=params['hra_m'], rent_paid_monthly=rent_monthly, metro_city=params['metro'], employer_nps_annual=params['nps_ann'], nps_pct_of_basic=params['nps_pct'], slab_scale_factor=slab_scale)
+            revised_eff_rate = revised_tax_info['effective_rate']
+        else:
+            revised_eff_rate = tax_info['effective_rate']
+
         th_monthly = params['net_0'] * ((1 + params['inc_growth']) ** t) if params['net_0'] > 0 else tax_info["take_home_monthly"]
         exp_monthly = th_monthly * params['exp_frac'] if params['exp_mode'] == 'fraction' else params['exp_abs'] * ((1 + params['exp_infl']) ** t)
         
-        bonus_gross = params['bonus_0'] * ((1 + params['bonus_gr']) ** t) if params['bonus_mode'] == 'fixed' else (gross_monthly * 12) * (params['bonus_0'] / 100.0) * ((1 + params['bonus_gr']) ** t)
+        bonus_gross = params['bonus_0'] * ((1 + params['bonus_gr']) ** t) if params['bonus_mode'] == 'fixed' else gross_annual * (params['bonus_0'] / 100.0) * ((1 + params['bonus_gr']) ** t)
         bonus_net = bonus_gross * (1.0 - tax_info['effective_rate']) if params['bonus_gross'] else bonus_gross
         bonus_savings = bonus_net * (params['bonus_sav_pct'] / 100.0)
         
         surplus_yr = max(0.0, th_monthly * 12 - exp_monthly * 12 - rent_monthly * 12) + bonus_savings
         req_liquid = params['cash_buf'] * ((1 + params['buf_infl']) ** t)
-        
-        apt_income, ag_income = [], []
-        for i, ac in enumerate(asset_classes):
-            yld_pct = max(0.0, ac.get("income_yield_pct", 0.0)) / 100.0
-            inc_tax = compute_asset_income_tax(asset_balances[i] * yld_pct, ac.get("income_tax_mode", "slab"), ac.get("income_tax_rate_pct", 0.0), tax_info["effective_rate"])
-            apt_income.append(inc_tax["post_tax"])
-            
-        reinvest_inflow = apt_income 
         
         sip_yr = []
         sip_subject_to_limit = 0.0
@@ -193,15 +187,33 @@ def simulate_portfolio(params, asset_classes):
         opening_portfolio = sum(asset_balances)
         new_bals = []
         total_added_to_assets = 0.0
+        breakdown_lines = []
         
         for i, ac in enumerate(asset_classes):
-            cap_r = ac["annual_return"] - (max(0.0, ac.get("income_yield_pct", 0.0)) / 100.0)
+            gross_r = ac["annual_return"]
+            
+            # Net Return calculation
+            if ac['tax_treatment'] == 'Exempt':
+                net_r = gross_r
+            elif ac['tax_treatment'] == 'Taxed at fixed rate':
+                net_r = gross_r * (1 - ac['fixed_tax_pct'])
+            else:
+                net_r = gross_r * (1 - revised_eff_rate)
+
             tf = TIMING_FACTORS.get(ac.get("contribution_timing", "monthly"), TIMING_FACTORS["monthly"])
             total_added = sip_yr[i] + surplus_alloc_in[i]
             total_added_to_assets += total_added
             
-            new_bals.append(asset_balances[i] * (1 + cap_r) + (total_added + reinvest_inflow[i]) * tf(cap_r))
+            # Compound with Net Return
+            new_bal = asset_balances[i] * (1 + net_r) + (total_added) * tf(net_r)
+            new_bals.append(new_bal)
+            breakdown_lines.append(f"{ac['name']}: ₹{new_bal:,.0f}")
             
+        if cash_accumulated > 0:
+            breakdown_lines.append(f"Static Cash: ₹{cash_accumulated:,.0f}")
+            
+        breakdown_str = " \n ".join(breakdown_lines)
+
         # Effective Return Rate Calculation (Modified Dietz)
         invested_closing = sum(new_bals)
         asset_gains = invested_closing - opening_portfolio - total_added_to_assets
@@ -216,7 +228,8 @@ def simulate_portfolio(params, asset_classes):
             'gross_monthly': gross_monthly, 'take_home_monthly': th_monthly, 'expense_monthly': exp_monthly,
             'rent_monthly': rent_monthly, 'surplus_yr': surplus_yr, 'req_liquid': req_liquid,
             'tax_info': tax_info, 'slab_scale': slab_scale, 
-            'shortfall_amt': shortfall_amt, 'excess_amt': excess_amt, 'eff_return_rate': eff_return_rate
+            'shortfall_amt': shortfall_amt, 'excess_amt': excess_amt, 'eff_return_rate': eff_return_rate,
+            'Breakdown': breakdown_str
         })
     return series
 
@@ -225,6 +238,10 @@ def run_affordability(params, asset_classes):
     res = []
     over_details, under_details = [], []
     
+    # Check if Surplus Allocation covers 100% of excess to suppress warning
+    total_alloc = sum([ac.get('surplus_alloc_pct', 0.0) for ac in asset_classes])
+    perfect_allocation = abs(total_alloc - 100.0) < 0.001
+
     for t, ps in enumerate(series):
         age = params['age'] + t
         h_t = params['house_price'] * ((1 + params['house_infl']) ** t)
@@ -232,7 +249,8 @@ def run_affordability(params, asset_classes):
         outlay = h_t * (1 + params['tx_cost'])
         
         if ps['shortfall_amt'] > 0: over_details.append((age, ps['shortfall_amt']))
-        if ps['excess_amt'] > 0: under_details.append((age, ps['excess_amt']))
+        # Only trigger under_details if allocation isn't handled perfectly
+        if ps['excess_amt'] > 0 and not perfect_allocation: under_details.append((age, ps['excess_amt']))
         
         max_loan_t, emi_aff_net = 0.0, 0.0
         if params['loan_enabled']:
@@ -259,7 +277,8 @@ def run_affordability(params, asset_classes):
             'Portfolio': v_t, 'HousePrice': h_t, 'MaxLoan': max_loan_t, 'CashLeft': cash_rem, 
             'EffEMI': actual_emi, 'AffEMI': emi_aff_net, 'Tax%': ps['tax_info']['effective_rate'] * 100, 
             'Eff_Return%': ps['eff_return_rate'] * 100,
-            'Affordable': "YES ✓" if affordable else "No"
+            'Affordable': "YES ✓" if affordable else "No",
+            'Breakdown': ps['Breakdown']
         })
         
     return res, over_details, under_details
@@ -276,13 +295,12 @@ with st.expander("💾 Load / Save Scenarios"):
     col_load, col_save = st.columns(2)
     with col_load:
         st.subheader("Load Scenario")
-        st.file_uploader("Upload a saved .json file", type="json", key="scenario_uploader", on_change=handle_scenario_upload)
+        st.file_uploader("Upload a saved .json file", type="json", key="scenario_uploader", on_change=handle_scenario_upload, help="What: Restores your previously saved inputs.\nHow: Drag and drop a .json scenario file here.\nExample: Drop 'my_house_scenario.json'")
     
     with col_save:
         st.subheader("Export Current Scenario")
         st.write("Save your current inputs below to a file so you can reload them later.")
         
-        # Build export dictionary natively from session state
         export_data = {
             "params": {k: st.session_state[k] for k in default_params.keys()},
             "assets": st.session_state['assets_data']
@@ -293,6 +311,7 @@ with st.expander("💾 Load / Save Scenarios"):
             data=json_string,
             file_name="my_house_scenario.json",
             mime="application/json",
+            help="What: Saves your current layout.\nHow: Click to download.\nExample: Saves a file to your PC."
         )
 
 tab1, tab2, tab3, tab4 = st.tabs(["👤 Personal & Housing", "💰 Income & Expenses", "📈 Assets & Loan", "📊 Results"])
@@ -301,46 +320,46 @@ with tab1:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Your Details")
-        st.number_input("Current Age", min_value=18, max_value=80, key="age")
-        st.number_input("Simulate up to age", min_value=19, key="max_age")
+        st.number_input("Current Age", min_value=18, max_value=80, key="age", help="What: Your current age.\nHow: Enter your age in years.\nExample: 30")
+        st.number_input("Simulate up to age", min_value=19, key="max_age", help="What: How far into the future to calculate.\nHow: Enter an age greater than your current age.\nExample: 60")
         
     with col2:
         st.subheader("Target Property")
-        st.number_input("House Price Today (₹)", step=500_000, key="house_price")
-        st.number_input("Annual Price Inflation (%)", key="house_infl")
-        st.number_input("Transaction Costs (%)", key="tx_cost")
-        st.number_input("Required Cash Buffer (₹)", step=100_000, key="cash_buf")
-        st.number_input("Buffer Inflation (%)", key="buf_infl")
+        st.number_input("House Price Today (₹)", step=500_000, key="house_price", help="What: Current cost of your target property.\nHow: Enter the value in Rupees.\nExample: 5000000")
+        st.number_input("Annual Price Inflation (%)", key="house_infl", help="What: Expected annual increase in property prices.\nHow: Enter as a percentage.\nExample: 5.0")
+        st.number_input("Transaction Costs (%)", key="tx_cost", help="What: Registration, stamp duty, and brokerage fees.\nHow: Enter as a percentage of property value.\nExample: 7.0")
+        st.number_input("Required Cash Buffer (₹)", step=100_000, key="cash_buf", help="What: Emergency cash you want left over after buying the house.\nHow: Enter amount in Rupees.\nExample: 1000000")
+        st.number_input("Buffer Inflation (%)", key="buf_infl", help="What: Annual increase in your required emergency cash.\nHow: Enter as a percentage.\nExample: 6.0")
 
 with tab2:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Income & Taxes")
-        st.number_input("Monthly Gross Income (₹)", step=10_000, key="income_0")
-        st.number_input("Monthly Net Take-Home (₹)", step=10_000, key="net_0")
-        st.number_input("Income Growth Rate (%)", key="inc_growth")
-        st.selectbox("Tax Regime", options=["new", "old"], format_func=lambda x: "New Regime" if x == "new" else "Old Regime", key="tax_regime")
+        st.number_input("Monthly Gross Income (₹)", step=10_000, key="income_0", help="What: Total monthly salary before deductions.\nHow: Enter amount in Rupees.\nExample: 100000")
+        st.number_input("Monthly Net Take-Home (₹)", step=10_000, key="net_0", help="What: Actual monthly in-hand salary.\nHow: Enter amount in Rupees.\nExample: 80000")
+        st.number_input("Income Growth Rate (%)", key="inc_growth", help="What: Expected annual salary increment.\nHow: Enter as a percentage.\nExample: 8.0")
+        st.selectbox("Tax Regime", options=["new", "old"], format_func=lambda x: "New Regime" if x == "new" else "Old Regime", key="tax_regime", help="What: The income tax regime you file under.\nHow: Select New or Old.\nExample: New Regime")
         
         with st.expander("Advanced Tax Settings"):
-            st.number_input("Basic Salary (₹/mo)", key="basic_m")
-            st.number_input("HRA Received (₹/mo)", key="hra_m")
-            st.checkbox("Metro City?", key="metro")
-            st.number_input("Annual Bonus (₹)", key="bonus_0")
-            st.number_input("Bonus Growth (%)", key="bonus_gr")
-            st.number_input("Bonus Savings (%)", key="bonus_sav_pct")
-            st.number_input("Other 80C (₹/yr)", key="other_80c")
-            st.number_input("Employer NPS (₹/yr)", key="nps_ann")
-            st.number_input("NPS % of Basic", key="nps_pct")
-            st.number_input("Slab Inflation (%)", key="slab_infl")
+            st.number_input("Basic Salary (₹/mo)", key="basic_m", help="What: Basic component of your salary.\nHow: Enter amount in Rupees.\nExample: 50000")
+            st.number_input("HRA Received (₹/mo)", key="hra_m", help="What: House Rent Allowance received.\nHow: Enter amount in Rupees.\nExample: 20000")
+            st.checkbox("Metro City?", key="metro", help="What: Determines 50% vs 40% HRA exemption.\nHow: Check if you live in a Metro.\nExample: Checked for Mumbai")
+            st.number_input("Annual Bonus (₹)", key="bonus_0", help="What: Expected yearly bonus amount.\nHow: Enter amount in Rupees.\nExample: 150000")
+            st.number_input("Bonus Growth (%)", key="bonus_gr", help="What: Annual increment of your bonus.\nHow: Enter as a percentage.\nExample: 5.0")
+            st.number_input("Bonus Savings (%)", key="bonus_sav_pct", help="What: How much of your bonus you save vs spend.\nHow: Enter as a percentage.\nExample: 100.0 means you save all of it.")
+            st.number_input("Other 80C (₹/yr)", key="other_80c", help="What: Deductions like ELSS or LIC.\nHow: Enter yearly amount.\nExample: 50000")
+            st.number_input("Employer NPS (₹/yr)", key="nps_ann", help="What: Corporate NPS contribution.\nHow: Enter yearly amount.\nExample: 50000")
+            st.number_input("NPS % of Basic", key="nps_pct", help="What: NPS contribution as % of basic salary.\nHow: Enter as percentage.\nExample: 10.0")
+            st.number_input("Slab Inflation (%)", key="slab_infl", help="What: Annual increase in tax slab limits.\nHow: Enter as percentage. (Usually 0)\nExample: 0.0")
 
     with col2:
         st.subheader("Expenses")
-        st.radio("Expense Mode", ["fraction", "absolute"], format_func=lambda x: "% of Take-Home" if x=="fraction" else "Fixed ₹ Amount", key="exp_mode")
-        st.number_input("Expenses (% of Take-Home)", key="exp_frac")
-        st.number_input("Fixed Expenses (₹/mo)", key="exp_abs")
-        st.number_input("Expense Inflation (%)", key="exp_infl")
-        st.number_input("Current Rent (₹/mo)", key="rent_0")
-        st.number_input("Rent Inflation (%)", key="rent_infl")
+        st.radio("Expense Mode", ["fraction", "absolute"], format_func=lambda x: "% of Take-Home" if x=="fraction" else "Fixed ₹ Amount", key="exp_mode", help="What: How to calculate living expenses.\nHow: Choose percentage or fixed amount.\nExample: % of Take-Home")
+        st.number_input("Expenses (% of Take-Home)", key="exp_frac", help="What: Living costs as a percentage of your salary.\nHow: Enter percentage.\nExample: 50.0")
+        st.number_input("Fixed Expenses (₹/mo)", key="exp_abs", help="What: Absolute fixed monthly living costs.\nHow: Enter amount in Rupees.\nExample: 40000")
+        st.number_input("Expense Inflation (%)", key="exp_infl", help="What: Inflation rate on your fixed expenses.\nHow: Enter as percentage.\nExample: 6.0")
+        st.number_input("Current Rent (₹/mo)", key="rent_0", help="What: Current monthly house rent.\nHow: Enter amount in Rupees.\nExample: 25000")
+        st.number_input("Rent Inflation (%)", key="rent_infl", help="What: Expected annual rent increase.\nHow: Enter as percentage.\nExample: 8.0")
 
 with tab3:
     st.subheader("Investment Accounts / Assets")
@@ -350,17 +369,18 @@ with tab3:
         num_rows="dynamic", 
         use_container_width=True,
         column_config={
-            "Stepup_type": st.column_config.SelectboxColumn("Stepup_type", options=["Percentage", "Fixed"], required=True),
-            "Invest_above_Surplus_Cash": st.column_config.CheckboxColumn("Invest above Surplus Cash", default=False)
+            "Stepup_type": st.column_config.SelectboxColumn("Stepup_type", options=["Percentage", "Fixed"], required=True, help="How your SIP increases yearly."),
+            "Invest_above_Surplus_Cash": st.column_config.CheckboxColumn("Invest above Surplus Cash", help="Check if funding comes from external sources (e.g. Employer)."),
+            "Tax_Treatment": st.column_config.SelectboxColumn("Tax Treatment", options=["Exempt", "Taxed at slab rate", "Taxed at fixed rate"], required=True, help="How the asset's returns are taxed."),
+            "Fixed_Tax_Pct": st.column_config.NumberColumn("Fixed Tax %", min_value=0.0, max_value=100.0, help="Only applies if 'Taxed at fixed rate' is selected.")
         }
     )
     
-    # Live Asset Totals under the table
     tot_open = sum(row.get("Opening_Value", 0.0) for _, row in edited_assets_df.iterrows())
     tot_sip = sum(row.get("monthly_contribution", 0.0) for _, row in edited_assets_df.iterrows())
     col_t1, col_t2 = st.columns(2)
-    col_t1.metric("Total Opening Balance", f"₹ {tot_open:,.0f}")
-    col_t2.metric("Total Monthly SIPs", f"₹ {tot_sip:,.0f}")
+    col_t1.metric("Total Opening Balance", f"₹ {tot_open:,.0f}", help="Sum of all initial values above.")
+    col_t2.metric("Total Monthly SIPs", f"₹ {tot_sip:,.0f}", help="Sum of all scheduled monthly contributions.")
     
     st.session_state['assets_data'] = edited_assets_df.to_dict(orient="records")
     
@@ -374,97 +394,32 @@ with tab3:
             "stepup_type": "pct" if row.get("Stepup_type") == "Percentage" else "fixed",
             "stepup_value": row.get("Stepup_Value", 0.0),
             "surplus_alloc_pct": row.get("Surplus_Allocation_Percentage", 0.0),
-            "invest_above_surplus": row.get("Invest_above_Surplus_Cash", False)
+            "invest_above_surplus": row.get("Invest_above_Surplus_Cash", False),
+            "tax_treatment": row.get("Tax_Treatment", "Exempt"),
+            "fixed_tax_pct": row.get("Fixed_Tax_Pct", 0.0) / 100.0
         })
 
     st.markdown("---")
     st.subheader("Home Loan Constraints")
-    st.checkbox("Enable Home Loan Financing", key="loan_enabled")
+    st.checkbox("Enable Home Loan Financing", key="loan_enabled", help="What: Determines if a loan is used to buy the house.\nHow: Check to enable.\nExample: Checked")
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.number_input("Loan Interest Rate (%)", key="loan_rate")
+        st.number_input("Loan Interest Rate (%)", key="loan_rate", help="What: Expected home loan interest rate.\nHow: Enter as percentage.\nExample: 8.5")
     with col2:
-        st.number_input("Loan Tenure (Years)", key="loan_tenure")
+        st.number_input("Loan Tenure (Years)", key="loan_tenure", help="What: Duration of the home loan.\nHow: Enter in years.\nExample: 20")
     with col3:
-        st.number_input("Bank Eligibility Multiplier", key="bank_mult")
+        st.number_input("Bank Eligibility Multiplier", key="bank_mult", help="What: Maximum loan bank gives based on gross salary.\nHow: Enter a multiplier.\nExample: 60 times gross monthly salary.")
         
-    st.radio("EMI Limit Mode", ["fraction", "fixed"], key="emi_mode")
-    st.number_input("Max EMI (% of Take-Home)", key="emi_frac")
-    st.number_input("Fixed EMI Limit (₹/mo)", key="emi_fixed")
-    st.number_input("EMI Safety Buffer (%)", key="emi_buf")
-    st.number_input("Max Loan I Want (₹) [0 for no cap]", key="user_max_loan")
+    st.radio("EMI Limit Mode", ["fraction", "fixed"], key="emi_mode", help="What: How you limit your maximum comfortable EMI.\nHow: Choose percentage or absolute value.\nExample: % of Take-Home")
+    st.number_input("Max EMI (% of Take-Home)", key="emi_frac", help="What: Maximum EMI you can pay as % of salary.\nHow: Enter as percentage.\nExample: 40.0")
+    st.number_input("Fixed EMI Limit (₹/mo)", key="emi_fixed", help="What: Absolute max EMI you are willing to pay.\nHow: Enter amount in Rupees.\nExample: 50000")
+    st.number_input("EMI Safety Buffer (%)", key="emi_buf", help="What: Conservative buffer applied against your EMI limit.\nHow: Enter as percentage.\nExample: 10.0")
+    st.number_input("Max Loan I Want (₹) [0 for no cap]", key="user_max_loan", help="What: Hard cap on total loan amount regardless of eligibility.\nHow: Enter amount in Rupees.\nExample: 20000000")
 
 with tab4:
     st.subheader("Simulation Results")
     
-    # Engine requires fractions for % fields
     params = {
         'age': st.session_state.age, 'max_years': st.session_state.max_age - st.session_state.age, 
         'house_price': st.session_state.house_price, 'house_infl': st.session_state.house_infl / 100.0,
-        'tx_cost': st.session_state.tx_cost / 100.0, 'cash_buf': st.session_state.cash_buf, 
-        'buf_infl': st.session_state.buf_infl / 100.0, 'income_0': st.session_state.income_0, 
-        'net_0': st.session_state.net_0, 'inc_growth': st.session_state.inc_growth / 100.0, 
-        'tax_regime': st.session_state.tax_regime, 'basic_m': st.session_state.basic_m, 
-        'hra_m': st.session_state.hra_m, 'metro': st.session_state.metro, 
-        'bonus_0': st.session_state.bonus_0, 'bonus_mode': st.session_state.bonus_mode, 
-        'bonus_gross': st.session_state.bonus_gross, 'bonus_gr': st.session_state.bonus_gr / 100.0, 
-        'bonus_sav_pct': st.session_state.bonus_sav_pct, 'other_80c': st.session_state.other_80c, 
-        'nps_ann': st.session_state.nps_ann, 'nps_pct': st.session_state.nps_pct, 
-        'slab_infl': st.session_state.slab_infl / 100.0, 'exp_mode': st.session_state.exp_mode, 
-        'exp_frac': st.session_state.exp_frac / 100.0, 'exp_abs': st.session_state.exp_abs, 
-        'exp_infl': st.session_state.exp_infl / 100.0, 'rent_0': st.session_state.rent_0, 
-        'rent_infl': st.session_state.rent_infl / 100.0, 'loan_enabled': st.session_state.loan_enabled, 
-        'loan_rate': st.session_state.loan_rate / 100.0, 'loan_tenure': st.session_state.loan_tenure,
-        'bank_mult': st.session_state.bank_mult, 'emi_mode': st.session_state.emi_mode, 
-        'emi_frac': st.session_state.emi_frac / 100.0, 'emi_fixed': st.session_state.emi_fixed,
-        'emi_buf': st.session_state.emi_buf / 100.0, 'user_max_loan': st.session_state.user_max_loan
-    }
-    
-    if st.button("▶ Run Simulation", type="primary"):
-        results, over_details, under_details = run_affordability(params, asset_classes)
-        df_res = pd.DataFrame(results)
-        
-        format_dict = {
-            'TakeHome/mo': '₹{:,.0f}', 'Surplus/yr': '₹{:,.0f}', 'Portfolio': '₹{:,.0f}',
-            'HousePrice': '₹{:,.0f}', 'MaxLoan': '₹{:,.0f}', 'CashLeft': '₹{:,.0f}',
-            'EffEMI': '₹{:,.0f}', 'AffEMI': '₹{:,.0f}', 'Tax%': '{:.1f}%', 'Eff_Return%': '{:.1f}%'
-        }
-        
-        affordable_rows = df_res[df_res['Affordable'] == "YES ✓"]
-        
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
-            df_res.to_excel(writer, sheet_name='Simulation Results', index=False)
-        
-        if over_details:
-            over_msg = "⚠️ **Budget Deficit Warning:** Your scheduled contributions exceed your available Surplus in the following years:\n\n"
-            for age_val, amt in over_details:
-                over_msg += f"- **Age {age_val}:** Shortfall of ₹{amt:,.0f}\n"
-            over_msg += "\n*Either lower your contributions, reduce expenses, or check 'Invest above Surplus Cash' if funding comes from external sources.*"
-            st.error(over_msg)
-        
-        if under_details:
-            under_msg = "ℹ️ **Unallocated Surplus Notice:** Your Surplus is greater than your planned SIPs in the following years:\n\n"
-            for age_val, amt in under_details:
-                under_msg += f"- **Age {age_val}:** Uninvested Surplus of ₹{amt:,.0f}\n"
-            under_msg += "\n*This leftover cash has been automatically reinvested via your 'Surplus Allocation Percentage' or moved to the unallocated static Cash bucket.*"
-            st.warning(under_msg)
-
-        col_msg, col_btn = st.columns([2, 1])
-        with col_msg:
-            if not affordable_rows.empty:
-                earliest_age = affordable_rows.iloc[0]['Age']
-                st.success(f"### 🎉 Earliest Affordable Age: {earliest_age}")
-            else:
-                st.error(f"### ❌ Not affordable by age {st.session_state.max_age}")
-                
-        with col_btn:
-            st.download_button(
-                label="📥 Download Detailed Excel",
-                data=excel_buffer.getvalue(),
-                file_name="house_affordability_results.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-            
-        st.dataframe(df_res.style.format(format_dict), use_container_width=True, height=600)
+        'tx_cost': st.session_state.tx_cost / 100.0, 'cash_buf': st.session_
