@@ -5,7 +5,7 @@ import io
 import json
 
 # =============================================================================
-# 0. SESSION STATE INITIALIZATION (For Save/Load Scenarios)
+# 0. SESSION STATE INITIALIZATION & STATE BUG FIX
 # =============================================================================
 default_params = {
     'age': 30, 'max_age': 60, 'house_price': 5000000, 'house_infl': 5.0,
@@ -20,19 +20,24 @@ default_params = {
     'emi_fixed': 50000, 'emi_buf': 0.0, 'user_max_loan': 0
 }
 
-# Initialize session state for standard inputs
 for key, val in default_params.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
-# Initialize session state for Asset table
-if 'assets_data' not in st.session_state:
-    st.session_state['assets_data'] = [{
-        "Asset_Class": "Savings/Equity", "Opening_Value": 0.0, "monthly_contribution": 0.0,
-        "Annual Return": 10.0, "Stepup_type": "Percentage", "Stepup_Value": 0.0, 
+# FIXED STATE BUG: Initialize tables only once to prevent Streamlit from overwriting new rows during typing.
+if 'assets_table' not in st.session_state:
+    st.session_state['assets_table'] = pd.DataFrame([{
+        "Asset_Class": "Equity Mutual Fund", "Opening_Value": 500000.0, "monthly_contribution": 20000.0,
+        "Annual Return": 12.0, "Stepup_type": "Percentage", "Stepup_Value": 5.0, 
         "Surplus_Allocation_Percentage": 100.0, "Invest_above_Surplus_Cash": False,
-        "Tax_Treatment": "Exempt", "Fixed_Tax_Pct": 0.0
-    }]
+        "Tax_Treatment": "Taxed at fixed rate", "Fixed_Tax_Pct": 12.5
+    }])
+
+if 'reinvest_table' not in st.session_state:
+    st.session_state['reinvest_table'] = pd.DataFrame(columns=["Source_Asset", "Destination_Asset", "Allocation_Pct"])
+
+if 'rebalance_table' not in st.session_state:
+    st.session_state['rebalance_table'] = pd.DataFrame(columns=["Year", "Source_Asset", "Destination_Asset", "Transfer_Type", "Value"])
 
 def handle_scenario_upload():
     uploaded_file = st.session_state.get("scenario_uploader")
@@ -40,10 +45,10 @@ def handle_scenario_upload():
         try:
             data = json.load(uploaded_file)
             for k, v in data.get("params", {}).items():
-                if k in st.session_state:
-                    st.session_state[k] = v
-            if "assets" in data:
-                st.session_state['assets_data'] = data["assets"]
+                if k in st.session_state: st.session_state[k] = v
+            if "assets" in data: st.session_state['assets_table'] = pd.DataFrame(data["assets"])
+            if "reinvest_rules" in data: st.session_state['reinvest_table'] = pd.DataFrame(data["reinvest_rules"])
+            if "rebalance_events" in data: st.session_state['rebalance_table'] = pd.DataFrame(data["rebalance_events"])
             st.success("Scenario loaded successfully!")
         except Exception as e:
             st.error(f"Error loading scenario: {e}")
@@ -124,10 +129,30 @@ def compute_annual_tax(annual_gross, tax_regime, home_loan_interest_paid=0.0, ho
 # =============================================================================
 TIMING_FACTORS = {'start': lambda r: (1 + r), 'mid': lambda r: (1 + r) ** 0.5, 'end': lambda r: 1.0, 'monthly': lambda r: (1 + r) ** 0.5}
 
-def simulate_portfolio(params, asset_classes):
+def simulate_portfolio(params, asset_classes, reinvest_rules, rebalance_events):
     series, n = [], len(asset_classes)
     asset_balances = [ac["initial_value"] for ac in asset_classes]
     cash_accumulated = 0.0  
+    
+    # Pre-process mappings
+    name_to_idx = {ac['name']: i for i, ac in enumerate(asset_classes)}
+    
+    reinvest_map = {}
+    for r in reinvest_rules:
+        src, dest, pct = r['Source_Asset'], r['Destination_Asset'], r['Allocation_Pct']
+        if src in name_to_idx and dest in name_to_idx:
+            s_idx, d_idx = name_to_idx[src], name_to_idx[dest]
+            if s_idx not in reinvest_map: reinvest_map[s_idx] = []
+            reinvest_map[s_idx].append((d_idx, pct / 100.0))
+            
+    rebalance_map = {}
+    for r in rebalance_events:
+        yr, src, dest, t_type, val = r['Year'], r['Source_Asset'], r['Destination_Asset'], r['Transfer_Type'], r['Value']
+        # Convert relative simulation year based on user's current age vs event year
+        rel_yr = yr - params['age']
+        if src in name_to_idx and dest in name_to_idx and rel_yr >= 0:
+            if rel_yr not in rebalance_map: rebalance_map[rel_yr] = []
+            rebalance_map[rel_yr].append((name_to_idx[src], name_to_idx[dest], t_type, val))
 
     for t in range(params['max_years'] + 1):
         gross_monthly = params['income_0'] * ((1 + params['inc_growth']) ** t)
@@ -135,16 +160,13 @@ def simulate_portfolio(params, asset_classes):
         rent_monthly = params['rent_0'] * ((1 + params['rent_infl']) ** t)
         slab_scale = (1 + params['slab_infl']) ** t
         
-        # Standard Salary Tax
         tax_info = compute_annual_tax(
             annual_gross=gross_annual, tax_regime=params['tax_regime'], other_80c_investments=params['other_80c'],
             basic_monthly=params['basic_m'], hra_received_monthly=params['hra_m'], rent_paid_monthly=rent_monthly,
             metro_city=params['metro'], employer_nps_annual=params['nps_ann'], nps_pct_of_basic=params['nps_pct'], slab_scale_factor=slab_scale
         )
         
-        # Dynamic Asset Tax Blending (Recalculate Effective Rate with Slab Assets)
         slab_asset_income = sum((asset_balances[i] * ac['annual_return']) for i, ac in enumerate(asset_classes) if ac['tax_treatment'] == 'Taxed at slab rate')
-        
         if slab_asset_income > 0:
             revised_tax_info = compute_annual_tax(gross_annual + slab_asset_income, tax_regime=params['tax_regime'], other_80c_investments=params['other_80c'], basic_monthly=params['basic_m'], hra_received_monthly=params['hra_m'], rent_paid_monthly=rent_monthly, metro_city=params['metro'], employer_nps_annual=params['nps_ann'], nps_pct_of_basic=params['nps_pct'], slab_scale_factor=slab_scale)
             revised_eff_rate = revised_tax_info['effective_rate']
@@ -187,34 +209,56 @@ def simulate_portfolio(params, asset_classes):
         opening_portfolio = sum(asset_balances)
         new_bals = []
         total_added_to_assets = 0.0
-        breakdown_lines = []
         
+        # 1. Calculate Net Returns & Inflows
+        net_returns_generated = []
         for i, ac in enumerate(asset_classes):
             gross_r = ac["annual_return"]
+            if ac['tax_treatment'] == 'Exempt': net_r = gross_r
+            elif ac['tax_treatment'] == 'Taxed at fixed rate': net_r = gross_r * (1 - ac['fixed_tax_pct'])
+            else: net_r = gross_r * (1 - revised_eff_rate)
             
-            # Net Return calculation
-            if ac['tax_treatment'] == 'Exempt':
-                net_r = gross_r
-            elif ac['tax_treatment'] == 'Taxed at fixed rate':
-                net_r = gross_r * (1 - ac['fixed_tax_pct'])
+            # Extract generated return for reallocation
+            generated_return = asset_balances[i] * net_r
+            net_returns_generated.append(generated_return)
+            
+        # 2. Reallocate Returns based on rules
+        reinvest_inflow = [0.0] * n
+        for i in range(n):
+            if i in reinvest_map:
+                for dest_idx, pct in reinvest_map[i]:
+                    reinvest_inflow[dest_idx] += net_returns_generated[i] * pct
             else:
-                net_r = gross_r * (1 - revised_eff_rate)
-
+                reinvest_inflow[i] += net_returns_generated[i] # Default 100% self
+                
+        # 3. Apply Balances
+        for i, ac in enumerate(asset_classes):
             tf = TIMING_FACTORS.get(ac.get("contribution_timing", "monthly"), TIMING_FACTORS["monthly"])
             total_added = sip_yr[i] + surplus_alloc_in[i]
             total_added_to_assets += total_added
             
-            # Compound with Net Return
-            new_bal = asset_balances[i] * (1 + net_r) + (total_added) * tf(net_r)
+            # Base + Reallocated Return + Additions compounded
+            # We don't compound the reinvested return itself inside the year to prevent double compounding
+            new_bal = asset_balances[i] + reinvest_inflow[i] + (total_added) * tf(0) 
             new_bals.append(new_bal)
-            breakdown_lines.append(f"{ac['name']}: ₹{new_bal:,.0f}")
             
+        # 4. Year-End Rebalancing Execution
+        if t in rebalance_map:
+            for src_i, dest_i, r_type, r_val in rebalance_map[t]:
+                src_bal = new_bals[src_i]
+                if r_type == 'Percentage': transfer_amt = src_bal * (r_val / 100.0)
+                else: transfer_amt = min(src_bal, r_val)
+                new_bals[src_i] -= transfer_amt
+                new_bals[dest_i] += transfer_amt
+
+        # 5. Breakdown Generation (Post-Rebalance)
+        breakdown_lines = []
+        for i, ac in enumerate(asset_classes):
+            breakdown_lines.append(f"{ac['name']}: ₹{new_bals[i]:,.0f}")
         if cash_accumulated > 0:
             breakdown_lines.append(f"Static Cash: ₹{cash_accumulated:,.0f}")
-            
-        breakdown_str = " \n ".join(breakdown_lines)
+        breakdown_str = "  |  ".join(breakdown_lines)
 
-        # Effective Return Rate Calculation (Modified Dietz)
         invested_closing = sum(new_bals)
         asset_gains = invested_closing - opening_portfolio - total_added_to_assets
         invested_base = opening_portfolio + (total_added_to_assets / 2)
@@ -229,16 +273,15 @@ def simulate_portfolio(params, asset_classes):
             'rent_monthly': rent_monthly, 'surplus_yr': surplus_yr, 'req_liquid': req_liquid,
             'tax_info': tax_info, 'slab_scale': slab_scale, 
             'shortfall_amt': shortfall_amt, 'excess_amt': excess_amt, 'eff_return_rate': eff_return_rate,
-            'Breakdown': breakdown_str
+            'Portfolio_Breakdown': breakdown_str
         })
     return series
 
-def run_affordability(params, asset_classes):
-    series = simulate_portfolio(params, asset_classes)
+def run_affordability(params, asset_classes, reinvest_rules, rebalance_events):
+    series = simulate_portfolio(params, asset_classes, reinvest_rules, rebalance_events)
     res = []
     over_details, under_details = [], []
     
-    # Check if Surplus Allocation covers 100% of excess to suppress warning
     total_alloc = sum([ac.get('surplus_alloc_pct', 0.0) for ac in asset_classes])
     perfect_allocation = abs(total_alloc - 100.0) < 0.001
 
@@ -249,7 +292,6 @@ def run_affordability(params, asset_classes):
         outlay = h_t * (1 + params['tx_cost'])
         
         if ps['shortfall_amt'] > 0: over_details.append((age, ps['shortfall_amt']))
-        # Only trigger under_details if allocation isn't handled perfectly
         if ps['excess_amt'] > 0 and not perfect_allocation: under_details.append((age, ps['excess_amt']))
         
         max_loan_t, emi_aff_net = 0.0, 0.0
@@ -278,7 +320,7 @@ def run_affordability(params, asset_classes):
             'EffEMI': actual_emi, 'AffEMI': emi_aff_net, 'Tax%': ps['tax_info']['effective_rate'] * 100, 
             'Eff_Return%': ps['eff_return_rate'] * 100,
             'Affordable': "YES ✓" if affordable else "No",
-            'Breakdown': ps['Breakdown']
+            'Portfolio_Breakdown': ps['Portfolio_Breakdown']
         })
         
     return res, over_details, under_details
@@ -290,7 +332,6 @@ def run_affordability(params, asset_classes):
 st.set_page_config(page_title="House Affordability Simulator", layout="wide")
 st.title("🏠 House Affordability Simulator")
 
-# --- Scenario Save/Load Section ---
 with st.expander("💾 Load / Save Scenarios"):
     col_load, col_save = st.columns(2)
     with col_load:
@@ -303,7 +344,9 @@ with st.expander("💾 Load / Save Scenarios"):
         
         export_data = {
             "params": {k: st.session_state[k] for k in default_params.keys()},
-            "assets": st.session_state['assets_data']
+            "assets": st.session_state['assets_table'].to_dict(orient='records'),
+            "reinvest_rules": st.session_state['reinvest_table'].to_dict(orient='records'),
+            "rebalance_events": st.session_state['rebalance_table'].to_dict(orient='records')
         }
         json_string = json.dumps(export_data, indent=2)
         st.download_button(
@@ -314,7 +357,7 @@ with st.expander("💾 Load / Save Scenarios"):
             help="What: Saves your current layout.\nHow: Click to download.\nExample: Saves a file to your PC."
         )
 
-tab1, tab2, tab3, tab4 = st.tabs(["👤 Personal & Housing", "💰 Income & Expenses", "📈 Assets & Loan", "📊 Results"])
+tab1, tab2, tab3, tab4 = st.tabs(["👤 Personal & Housing", "💰 Income & Expenses", "📈 Assets, Rules & Loan", "📊 Results"])
 
 with tab1:
     col1, col2 = st.columns(2)
@@ -362,12 +405,13 @@ with tab2:
         st.number_input("Rent Inflation (%)", key="rent_infl", help="What: Expected annual rent increase.\nHow: Enter as percentage.\nExample: 8.0")
 
 with tab3:
-    st.subheader("Investment Accounts / Assets")
+    st.subheader("1. Investment Accounts / Assets")
     
     edited_assets_df = st.data_editor(
-        pd.DataFrame(st.session_state['assets_data']), 
+        st.session_state['assets_table'], 
         num_rows="dynamic", 
         use_container_width=True,
+        key="assets_ui",
         column_config={
             "Stepup_type": st.column_config.SelectboxColumn("Stepup_type", options=["Percentage", "Fixed"], required=True, help="How your SIP increases yearly."),
             "Invest_above_Surplus_Cash": st.column_config.CheckboxColumn("Invest above Surplus Cash", help="Check if funding comes from external sources (e.g. Employer)."),
@@ -375,6 +419,8 @@ with tab3:
             "Fixed_Tax_Pct": st.column_config.NumberColumn("Fixed Tax %", min_value=0.0, max_value=100.0, help="Only applies if 'Taxed at fixed rate' is selected.")
         }
     )
+    # Sync edited data quietly for Scenario Saving
+    st.session_state['assets_table'] = edited_assets_df
     
     tot_open = sum(row.get("Opening_Value", 0.0) for _, row in edited_assets_df.iterrows())
     tot_sip = sum(row.get("monthly_contribution", 0.0) for _, row in edited_assets_df.iterrows())
@@ -382,25 +428,46 @@ with tab3:
     col_t1.metric("Total Opening Balance", f"₹ {tot_open:,.0f}", help="Sum of all initial values above.")
     col_t2.metric("Total Monthly SIPs", f"₹ {tot_sip:,.0f}", help="Sum of all scheduled monthly contributions.")
     
-    st.session_state['assets_data'] = edited_assets_df.to_dict(orient="records")
+    asset_names_list = edited_assets_df["Asset_Class"].dropna().unique().tolist()
     
-    asset_classes = []
-    for _, row in edited_assets_df.iterrows():
-        asset_classes.append({
-            "name": row.get("Asset_Class", "Asset"),
-            "initial_value": row.get("Opening_Value", 0.0),
-            "monthly_contribution": row.get("monthly_contribution", 0.0),
-            "annual_return": row.get("Annual Return", 0.0) / 100.0,
-            "stepup_type": "pct" if row.get("Stepup_type") == "Percentage" else "fixed",
-            "stepup_value": row.get("Stepup_Value", 0.0),
-            "surplus_alloc_pct": row.get("Surplus_Allocation_Percentage", 0.0),
-            "invest_above_surplus": row.get("Invest_above_Surplus_Cash", False),
-            "tax_treatment": row.get("Tax_Treatment", "Exempt"),
-            "fixed_tax_pct": row.get("Fixed_Tax_Pct", 0.0) / 100.0
-        })
+    st.markdown("---")
+    st.subheader("2. Return Reallocation Rules")
+    st.write("By default, returns compound inside the same asset. Use this matrix to move an asset's generated returns into different assets. **Rules for a single Source Asset must sum to exactly 100%.**")
+    
+    edited_reinvest_df = st.data_editor(
+        st.session_state['reinvest_table'],
+        num_rows="dynamic",
+        use_container_width=True,
+        key="reinvest_ui",
+        column_config={
+            "Source_Asset": st.column_config.SelectboxColumn(options=asset_names_list, required=True),
+            "Destination_Asset": st.column_config.SelectboxColumn(options=asset_names_list, required=True),
+            "Allocation_Pct": st.column_config.NumberColumn("Allocation %", min_value=0.0, max_value=100.0, required=True)
+        }
+    )
+    st.session_state['reinvest_table'] = edited_reinvest_df
 
     st.markdown("---")
-    st.subheader("Home Loan Constraints")
+    st.subheader("3. Scheduled Rebalancing Events")
+    st.write("Schedule a one-time capital transfer between assets at the end of a specific year.")
+    
+    edited_rebalance_df = st.data_editor(
+        st.session_state['rebalance_table'],
+        num_rows="dynamic",
+        use_container_width=True,
+        key="rebalance_ui",
+        column_config={
+            "Year": st.column_config.NumberColumn("At End of Age", min_value=st.session_state.age, max_value=st.session_state.max_age, required=True),
+            "Source_Asset": st.column_config.SelectboxColumn(options=asset_names_list, required=True),
+            "Destination_Asset": st.column_config.SelectboxColumn(options=asset_names_list, required=True),
+            "Transfer_Type": st.column_config.SelectboxColumn("Type", options=["Percentage", "Absolute ₹"], required=True),
+            "Value": st.column_config.NumberColumn("Amount/%", min_value=0.0, required=True)
+        }
+    )
+    st.session_state['rebalance_table'] = edited_rebalance_df
+
+    st.markdown("---")
+    st.subheader("4. Home Loan Constraints")
     st.checkbox("Enable Home Loan Financing", key="loan_enabled", help="What: Determines if a loan is used to buy the house.\nHow: Check to enable.\nExample: Checked")
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -419,6 +486,37 @@ with tab3:
 with tab4:
     st.subheader("Simulation Results")
     
+    # 1. Validation Logic
+    validation_passed = True
+    if not edited_reinvest_df.empty:
+        grouped = edited_reinvest_df.groupby("Source_Asset")["Allocation_Pct"].sum()
+        for src, total in grouped.items():
+            if abs(total - 100.0) > 0.001:
+                st.error(f"🛑 **Validation Error:** Return reallocation rules for '{src}' sum to {total}%. It must equal exactly 100%. Please fix in the Assets Tab before running.")
+                validation_passed = False
+                
+    if not validation_passed:
+        st.stop()
+        
+    # 2. Extract Data
+    asset_classes = []
+    for _, row in edited_assets_df.iterrows():
+        asset_classes.append({
+            "name": row.get("Asset_Class", "Asset"),
+            "initial_value": row.get("Opening_Value", 0.0),
+            "monthly_contribution": row.get("monthly_contribution", 0.0),
+            "annual_return": row.get("Annual Return", 0.0) / 100.0,
+            "stepup_type": "pct" if row.get("Stepup_type") == "Percentage" else "fixed",
+            "stepup_value": row.get("Stepup_Value", 0.0),
+            "surplus_alloc_pct": row.get("Surplus_Allocation_Percentage", 0.0),
+            "invest_above_surplus": row.get("Invest_above_Surplus_Cash", False),
+            "tax_treatment": row.get("Tax_Treatment", "Exempt"),
+            "fixed_tax_pct": row.get("Fixed_Tax_Pct", 0.0) / 100.0
+        })
+        
+    reinvest_rules = edited_reinvest_df.to_dict(orient='records')
+    rebalance_events = edited_rebalance_df.to_dict(orient='records')
+
     params = {
         'age': st.session_state.age, 'max_years': st.session_state.max_age - st.session_state.age, 
         'house_price': st.session_state.house_price, 'house_infl': st.session_state.house_infl / 100.0,
@@ -439,10 +537,10 @@ with tab4:
         'bank_mult': st.session_state.bank_mult, 'emi_mode': st.session_state.emi_mode, 
         'emi_frac': st.session_state.emi_frac / 100.0, 'emi_fixed': st.session_state.emi_fixed,
         'emi_buf': st.session_state.emi_buf / 100.0, 'user_max_loan': st.session_state.user_max_loan
-    }  # <--- MAKE SURE THIS CLOSING BRACE IS HERE
+    }
     
     if st.button("▶ Run Simulation", type="primary"):
-        results, over_details, under_details = run_affordability(params, asset_classes)
+        results, over_details, under_details = run_affordability(params, asset_classes, reinvest_rules, rebalance_events)
         df_res = pd.DataFrame(results)
         
         format_dict = {
@@ -459,56 +557,29 @@ with tab4:
         
         if over_details:
             over_msg = "⚠️ **Budget Deficit Warning:** Your scheduled contributions exceed your available Surplus in the following years:\n\n"
-            for age_val, amt in over_details:
-                over_msg += f"- **Age {age_val}:** Shortfall of ₹{amt:,.0f}\n"
-            over_msg += "\n*Either lower your contributions, reduce expenses, or check 'Invest above Surplus Cash' if funding comes from external sources.*"
+            for age_val, amt in over_details: over_msg += f"- **Age {age_val}:** Shortfall of ₹{amt:,.0f}\n"
             st.error(over_msg)
         
         if under_details:
             under_msg = "ℹ️ **Unallocated Surplus Notice:** Your Surplus is greater than your planned SIPs in the following years:\n\n"
-            for age_val, amt in under_details:
-                under_msg += f"- **Age {age_val}:** Uninvested Surplus of ₹{amt:,.0f}\n"
-            under_msg += "\n*This leftover cash has been routed to the unallocated static Cash bucket. Allocate 100% of your Surplus in the Assets tab to suppress this warning.*"
+            for age_val, amt in under_details: under_msg += f"- **Age {age_val}:** Uninvested Surplus of ₹{amt:,.0f}\n"
             st.warning(under_msg)
 
         col_msg, col_btn = st.columns([2, 1])
         with col_msg:
-            if not affordable_rows.empty:
-                earliest_age = affordable_rows.iloc[0]['Age']
-                st.success(f"### 🎉 Earliest Affordable Age: {earliest_age}")
-            else:
-                st.error(f"### ❌ Not affordable by age {st.session_state.max_age}")
+            if not affordable_rows.empty: st.success(f"### 🎉 Earliest Affordable Age: {affordable_rows.iloc[0]['Age']}")
+            else: st.error(f"### ❌ Not affordable by age {st.session_state.max_age}")
                 
         with col_btn:
             st.download_button(
-                label="📥 Download Detailed Excel",
-                data=excel_buffer.getvalue(),
-                file_name="house_affordability_results.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                help="What: Downloads the full year-by-year dataset.\nHow: Click to download.\nExample: house_affordability_results.xlsx"
+                label="📥 Download Detailed Excel", data=excel_buffer.getvalue(),
+                file_name="house_affordability_results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
             )
             
-        # --- FIXED DATAFRAME RENDERING ---
-        # Rename the Breakdown column for a cleaner UI header
-        df_display = df_res.rename(columns={'Breakdown': 'Portfolio_Breakdown'})
-        
-        # Replace newlines with a clean separator so it fits perfectly in a single table cell
-        df_display['Portfolio_Breakdown'] = df_display['Portfolio_Breakdown'].str.replace(' \n ', '  |  ')
-        
-        # Apply the standard currency and percentage formatting
-        styled_df = df_display.style.format(format_dict)
-        
-        # Render the dataframe using Streamlit's native column configuration
-        st.dataframe(
-            styled_df, 
-            use_container_width=True, 
-            height=600,
+        df_display = df_res.style.format(format_dict)
+        st.dataframe(df_display, use_container_width=True, height=600,
             column_config={
-                "Portfolio_Breakdown": st.column_config.TextColumn(
-                    "Portfolio Breakdown",
-                    help="Exact asset balances making up your total Portfolio for this year.",
-                    width="large"
-                )
+                "Portfolio_Breakdown": st.column_config.TextColumn("Portfolio Breakdown", help="Exact asset balances post-rebalancing for this year.", width="large")
             }
         )
