@@ -313,6 +313,12 @@ def compute_annual_tax(annual_gross, tax_regime, other_80c=0., basic_m=0.,
 # REBALANCE ENGINE
 # =============================================================================
 def build_rebalance_schedule(rb_df, name_to_idx, sim_start_age, max_years):
+    """
+    Convert rebalance rules into a year-indexed schedule dict.
+    Key insight: Start_Age=0 or blank means "use simulation start age" for
+    One-Time/Annual, and "first fire after one frequency period" for Every N Years.
+    This prevents rebalancing from firing spuriously in year 0 before assets accumulate.
+    """
     schedule = {}
 
     def add(t, rule):
@@ -325,9 +331,19 @@ def build_rebalance_schedule(rb_df, name_to_idx, sim_start_age, max_years):
         dest      = str(row.get("Destination_Asset","")).strip()
         t_type    = str(row.get("Transfer_Type","Percentage")).strip()
         val       = float(row.get("Value",0) or 0)
-        start_age = int(row.get("Start_Age",0) or 0)
-        end_age   = int(row.get("End_Age",0) or 0)
-        freq      = int(row.get("Frequency_Years",1) or 1)
+
+        # Safely parse ages — None/NaN/0 all treated as "not set"
+        def _age(key, default=0):
+            v = row.get(key, None)
+            try:
+                iv = int(float(v))
+                return iv if iv > 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        start_age = _age("Start_Age", sim_start_age)
+        end_age   = _age("End_Age",   0)
+        freq      = max(1, _age("Frequency_Years", 1))
         thr_asset = str(row.get("Threshold_Asset","") or "").strip()
         thr_amt   = float(row.get("Threshold_Amount",0) or 0)
 
@@ -336,28 +352,35 @@ def build_rebalance_schedule(rb_df, name_to_idx, sim_start_age, max_years):
         si, di = name_to_idx[src], name_to_idx[dest]
 
         if trigger == "One-Time":
-            add(start_age - sim_start_age, (si, di, t_type, val))
+            sim_t = start_age - sim_start_age
+            add(sim_t, (si, di, t_type, val))
 
         elif trigger == "Annual":
-            s = max(0, start_age - sim_start_age)
-            e = min(max_years, (end_age - sim_start_age) if end_age > 0 else max_years)
-            for t in range(s, e+1):
-                add(t, (si, di, t_type, val))
+            # start_age=0 means start from year 1 (not year 0) to avoid spurious t=0 fire
+            s = max(1, start_age - sim_start_age)
+            e = min(max_years, (end_age - sim_start_age) if end_age > sim_start_age else max_years)
+            for sim_t in range(s, e + 1):
+                add(sim_t, (si, di, t_type, val))
 
         elif trigger == "Every N Years":
-            s = max(0, start_age - sim_start_age)
-            e = min(max_years, (end_age - sim_start_age) if end_age > 0 else max_years)
-            t = s
-            while t <= e:
-                add(t, (si, di, t_type, val)); t += max(1, freq)
+            # If start_age not meaningfully set, first fire is at t=freq (not t=0)
+            if start_age <= sim_start_age:
+                s = freq   # first fire after one full period
+            else:
+                s = max(1, start_age - sim_start_age)
+            e = min(max_years, (end_age - sim_start_age) if end_age > sim_start_age else max_years)
+            sim_t = s
+            while sim_t <= e:
+                add(sim_t, (si, di, t_type, val))
+                sim_t += freq
 
         elif trigger == "Balance Threshold":
-            ti = name_to_idx.get(thr_asset, -1)
-            if ti == -1: continue
-            s = max(0, start_age - sim_start_age) if start_age > 0 else 0
-            e = min(max_years, (end_age - sim_start_age) if end_age > 0 else max_years)
-            for t in range(s, e+1):
-                add(t, ('__thr__', si, di, t_type, val, ti, thr_amt))
+            thr_idx = name_to_idx.get(thr_asset, -1)
+            if thr_idx == -1: continue
+            s = max(1, start_age - sim_start_age) if start_age > sim_start_age else 1
+            e = min(max_years, (end_age - sim_start_age) if end_age > sim_start_age else max_years)
+            for sim_t in range(s, e + 1):
+                add(sim_t, ('__thr__', si, di, t_type, val, thr_idx, thr_amt))
 
     return schedule
 
@@ -495,7 +518,6 @@ def _check_affordable(h_price, v_t, max_loan_t, req_liquid,
                        params, take_home_m, gross_m, emi_aff_net):
     """Return (affordable_bool, actual_emi) for a given house price."""
     outlay = h_price * (1 + params['tx_cost'])
-    # cap loan to this outlay
     loan = min(max_loan_t, outlay) if params['loan_enabled'] else 0.0
     down = max(0., outlay - loan)
     cash_rem = v_t - down
@@ -507,34 +529,26 @@ def _check_affordable(h_price, v_t, max_loan_t, req_liquid,
     return (c1 and c2 and c3), emi
 
 
-def affordable_sqft(ps, params, v_t, max_loan_t, emi_aff_net, rate_psf_today, t):
+def compute_affordable_sqft(v_t, max_loan_t, req_liquid, h_t, target_sqft):
     """
-    Binary-search for the LARGEST house (in sq ft) that passes all three
-    affordability tests: finance, liquidity/buffer, EMI.
-    The market rate per sq ft is inflated at house_infl each year.
-    Returns sq ft (float), 0 if nothing is affordable.
+    Compute affordable sq ft using the direct formula:
+        Aff_Sqft = (Portfolio + MaxLoan - CashBuffer) / (HousePrice_t / TargetSqft)
+
+    - HousePrice_t / TargetSqft  = implied price per sq ft this year
+      (derived from the house price the user entered, inflated to year t)
+    - Portfolio + MaxLoan - CashBuffer = net spendable budget after
+      keeping the required cash buffer aside
+
+    Returns 0 if target_sqft is 0, if the implied psf is 0,
+    or if the net budget is negative.
     """
-    if rate_psf_today <= 0:
+    if target_sqft <= 0 or h_t <= 0:
         return 0.0
-    psf = rate_psf_today * ((1 + params['house_infl']) ** t)
-    req_liq = ps['req_liquid']
-    take_home_m = ps['take_home_monthly']
-    gross_m = ps['gross_monthly']
-
-    lo, hi = 0., 100_000.   # search range 0 to 1 lakh sq ft
-    # quick check: can we afford 1 sq ft at all?
-    ok, _ = _check_affordable(psf * 1, v_t, max_loan_t, req_liq,
-                               params, take_home_m, gross_m, emi_aff_net)
-    if not ok:
+    implied_psf = h_t / target_sqft        # ₹ per sq ft at year t
+    net_budget  = v_t + max_loan_t - req_liquid
+    if net_budget <= 0 or implied_psf <= 0:
         return 0.0
-
-    for _ in range(50):   # 50 iterations → precision < 0.003 sq ft
-        mid = (lo + hi) / 2.
-        ok, _ = _check_affordable(psf * mid, v_t, max_loan_t, req_liq,
-                                   params, take_home_m, gross_m, emi_aff_net)
-        if ok: lo = mid
-        else:  hi = mid
-    return lo
+    return net_budget / implied_psf
 
 
 def run_affordability(params, asset_classes, reinvest_rules, rebalance_df):
@@ -568,10 +582,10 @@ def run_affordability(params, asset_classes, reinvest_rules, rebalance_df):
             h_t, v_t, max_loan_t, ps['req_liquid'],
             params, ps['take_home_monthly'], ps['gross_monthly'], emi_aff_net)
 
-        # Affordable sq ft — binary-search version
-        aff_sqft_val = affordable_sqft(
-            ps, params, v_t, max_loan_t, emi_aff_net,
-            params.get('target_sqft', 0), t)
+        # Affordable sq ft — direct formula
+        aff_sqft_val = compute_affordable_sqft(
+            v_t, max_loan_t, ps['req_liquid'],
+            h_t, params.get('target_sqft', 0))
 
         res.append({
             'Age': age,
@@ -691,17 +705,41 @@ st.markdown('</div>', unsafe_allow_html=True)
 # =============================================================================
 # TABS — shown prominently right below hero
 # =============================================================================
-tab1, tab2, tab3, tab4 = st.tabs([
-    "👤  Personal & Housing",
-    "💰  Income & Expenses",
-    "📈  Assets & Loan",
-    "📊  Results"
-])
+# ── Manual tab bar (so Next/Prev buttons actually work) ──
+TAB_LABELS = [
+    ("👤", "Personal & Housing"),
+    ("💰", "Income & Expenses"),
+    ("📈", "Assets & Loan"),
+    ("📊", "Results"),
+]
+_at = st.session_state.get('active_tab', 0)
+
+tab_cols = st.columns(len(TAB_LABELS))
+for _i, (_icon, _label) in enumerate(TAB_LABELS):
+    with tab_cols[_i]:
+        _is_active = (_i == _at)
+        _btn_style = (
+            "background:linear-gradient(135deg,#1d6fce,#2d4a9e);color:#fff;border:none;"
+            "border-radius:8px;padding:.55rem 1rem;font-weight:700;font-size:.85rem;"
+            "width:100%;cursor:pointer;box-shadow:0 2px 6px rgba(29,111,206,.3);"
+        ) if _is_active else (
+            "background:#fff;color:#334155;border:1.5px solid #d1dbe8;"
+            "border-radius:8px;padding:.55rem 1rem;font-weight:600;font-size:.85rem;"
+            "width:100%;cursor:pointer;"
+        )
+        if st.button(f"{_icon}  {_label}", key=f"tab_btn_{_i}",
+                     use_container_width=True,
+                     type="primary" if _is_active else "secondary"):
+            st.session_state['active_tab'] = _i
+            st.rerun()
+
+st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+_at = st.session_state.get('active_tab', 0)  # re-read after potential rerun
 
 # ─────────────────────────────────────────────
 # TAB 1
 # ─────────────────────────────────────────────
-with tab1:
+if _at == 0:
     tip("Start here. Tell the simulator <strong>who you are</strong> and <strong>what home you want to buy</strong>.")
     col1, col2 = st.columns(2, gap="large")
 
@@ -732,19 +770,22 @@ with tab1:
                 help="How fast your required cash buffer grows each year. Match to general inflation.\nExample: 6.0")
 
         section_header("📐", "Sq Ft Affordability")
-        st.caption("Optional — shows how many sq ft you can afford each year (passes all 3 tests).")
-        st.number_input("Market Rate Today (₹/sq ft)", min_value=0, step=500, key="target_sqft",
-            help="Current price per sq ft in your target area. Leave 0 to skip.\n"
-                 "The simulator inflates this rate at house_infl% each year, then binary-searches for the "
-                 "largest sq ft home your portfolio + loan can fund — while still meeting the buffer and EMI tests.\n"
-                 "Example: ₹18,000/sq ft in Andheri East → enter 18000")
+        st.caption("Optional — enter your target home size to see affordable sq ft each year.")
+        st.number_input("Target Home Size (sq ft)", min_value=0, step=50, key="target_sqft",
+            help="How many sq ft is the home you want to buy?\n\n"
+                 "Leave at 0 to skip this feature entirely.\n\n"
+                 "When filled, the simulator derives the implied price per sq ft from your house price "
+                 "(HousePrice ÷ TargetSqft) and inflates it each year. The 'Affordable Sq Ft' column "
+                 "in Results then shows: (Portfolio + MaxLoan - CashBuffer) ÷ (inflated ₹/sq ft) — "
+                 "i.e. the largest home you can afford that year at the prevailing market rate.\n\n"
+                 "Example: If your target is an 800 sq ft flat, enter 800.")
 
     nav_buttons(0)
 
 # ─────────────────────────────────────────────
 # TAB 2
 # ─────────────────────────────────────────────
-with tab2:
+elif _at == 1:
     tip("Tell the simulator how much you <strong>earn, spend, and save</strong> each month.")
     col1, col2 = st.columns(2, gap="large")
 
@@ -828,7 +869,7 @@ with tab2:
 # ─────────────────────────────────────────────
 # TAB 3
 # ─────────────────────────────────────────────
-with tab3:
+elif _at == 2:
     tip("Define your <strong>current investments</strong>, how they grow, rebalancing rules, and home loan eligibility.")
 
     section_header("📂", "Investment Accounts / Assets")
@@ -978,7 +1019,7 @@ with tab3:
 # ─────────────────────────────────────────────
 # TAB 4 — Results
 # ─────────────────────────────────────────────
-with tab4:
+elif _at == 3:
     tip("Click <strong>▶ Run Simulation</strong> to get your year-by-year forecast and earliest affordable age.")
 
     # Validation
