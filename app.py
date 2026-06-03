@@ -813,7 +813,7 @@ with tab4:
             "surplus_alloc_pct": row.get("Surplus_Allocation_Percentage", 0.0),
             "invest_above_surplus": row.get("Invest_above_Surplus_Cash", False),
             "tax_treatment": row.get("Tax_Treatment", "Exempt"),
-            "fixed_tax_pct": row.get("Fixed_Tax_Pct", 0.0) / 100.0
+            "fixed_tax_pct": (float(row.get("Fixed_Tax_Pct") or 0.0)) / 100.0
         })
 
     reinvest_rules = edited_reinvest_df.to_dict(orient='records')
