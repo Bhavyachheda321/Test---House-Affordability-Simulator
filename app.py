@@ -101,8 +101,6 @@ details > div{background:var(--surface) !important;border:1.5px solid var(--bord
 .save-banner .sb-title{font-size:.85rem;font-weight:700;color:var(--amber);}
 .save-banner .sb-sub{font-size:.78rem;color:var(--text-secondary);margin-top:.15rem;line-height:1.5;}
 
-/* ── Nav row ── */
-.nav-row{display:flex;justify-content:space-between;align-items:center;margin-top:1.8rem;padding-top:1rem;border-top:1.5px solid var(--border);}
 
 /* ── Dataframe ── */
 .stDataFrame{border-radius:var(--radius) !important;overflow:hidden;box-shadow:var(--shadow-sm);}
@@ -612,22 +610,21 @@ def _check_affordable(h_price, v_t, max_loan_t, req_liquid,
     return (c1 and c2 and c3), emi
 
 
-def compute_affordable_sqft(v_t, max_loan_t, req_liquid, h_t, target_sqft):
+def compute_affordable_sqft(v_t, max_loan_t, req_liquid, h_t, target_sqft, tx_cost):
     """
-    Compute affordable sq ft using the direct formula:
-        Aff_Sqft = (Portfolio + MaxLoan - CashBuffer) / (HousePrice_t / TargetSqft)
+    Compute affordable sq ft using:
+        Aff_Sqft = (Portfolio + MaxLoan - CashBuffer) / ((HousePrice_t * (1+tx_cost)) / TargetSqft)
 
-    - HousePrice_t / TargetSqft  = implied price per sq ft this year
-      (derived from the house price the user entered, inflated to year t)
-    - Portfolio + MaxLoan - CashBuffer = net spendable budget after
-      keeping the required cash buffer aside
+    The denominator uses HousePrice_t * (1+tx_cost) — exactly the same outlay the
+    Affordable column tests against — so Aff_Sqft reaches TargetSqft at precisely
+    the same year Affordable becomes YES for the first time.
 
-    Returns 0 if target_sqft is 0, if the implied psf is 0,
-    or if the net budget is negative.
+    Returns 0 if target_sqft is 0, if the net budget is negative, or if inputs invalid.
     """
     if target_sqft <= 0 or h_t <= 0:
         return 0.0
-    implied_psf = h_t / target_sqft        # ₹ per sq ft at year t
+    outlay_t    = h_t * (1 + tx_cost)          # house price + transaction costs
+    implied_psf = outlay_t / target_sqft        # effective ₹ per sq ft incl. costs
     net_budget  = v_t + max_loan_t - req_liquid
     if net_budget <= 0 or implied_psf <= 0:
         return 0.0
@@ -665,10 +662,10 @@ def run_affordability(params, asset_classes, reinvest_rules, rebalance_df):
             h_t, v_t, max_loan_t, ps['req_liquid'],
             params, ps['take_home_monthly'], ps['gross_monthly'], emi_aff_net)
 
-        # Affordable sq ft — direct formula
+        # Affordable sq ft — direct formula (tx_cost included so it aligns with Affordable column)
         aff_sqft_val = compute_affordable_sqft(
             v_t, max_loan_t, ps['req_liquid'],
-            h_t, params.get('target_sqft', 0))
+            h_t, params.get('target_sqft', 0), params['tx_cost'])
 
         res.append({
             'Age': age,
@@ -701,19 +698,7 @@ def section_header(icon, title):
 def tip(text):
     st.markdown(f'<div class="tip-box">{text}</div>', unsafe_allow_html=True)
 
-def nav_buttons(current_tab, total=4):
-    st.markdown('<div class="nav-row">', unsafe_allow_html=True)
-    cp, _, cn = st.columns([1,4,1])
-    with cp:
-        if current_tab>0:
-            if st.button("← Previous", key=f"prev_{current_tab}"):
-                go_to_tab(current_tab-1); st.rerun()
-    with cn:
-        if current_tab<total-1:
-            lbl = "Go to Results →" if current_tab==total-2 else "Next →"
-            if st.button(lbl, key=f"next_{current_tab}", type="primary"):
-                go_to_tab(current_tab+1); st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
+
 
 
 # =============================================================================
@@ -768,7 +753,7 @@ with col_ht:
 | 📈 Assets & Loan | Investments, SIPs, rebalancing, loan | Models wealth growth |
 | 📊 Results | Click ▶ Run | Year-by-year forecast |
 
-**Tip:** Use **Next →** at the bottom of each tab to move forward.
+**Tip:** Fill each tab in order, then click **📊 Results** to run the simulation.
         """)
 
 with col_ls:
@@ -865,7 +850,6 @@ with tab1:
                  "i.e. the largest home you can afford that year at the prevailing market rate.\n\n"
                  "Example: If your target is an 800 sq ft flat, enter 800.")
 
-    nav_buttons(0)
 
 # ─────────────────────────────────────────────
 # TAB 2
@@ -949,7 +933,6 @@ with tab2:
             st.number_input("Rent Inflation (%)", key="rent_infl",
                 help="How fast rent increases each year. Typically 8–10% in Indian cities.\nExample: 8.0")
 
-    nav_buttons(1)
 
 # ─────────────────────────────────────────────
 # TAB 3
@@ -1099,7 +1082,6 @@ with tab3:
         st.number_input("Max Loan I Want (₹) — 0 for no cap", key="user_max_loan",
             help="Hard cap on borrowing regardless of bank eligibility. Enter 0 to let bank limit apply.\nExample: 10000000")
 
-    nav_buttons(2)
 
 # ─────────────────────────────────────────────
 # TAB 4 — Results
