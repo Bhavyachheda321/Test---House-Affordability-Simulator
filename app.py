@@ -128,7 +128,7 @@ hr{border-color:var(--border) !important;margin:1.3rem 0 !important;}
 # =============================================================================
 default_params = {
     'age': 30, 'max_age': 60, 'house_price': 5000000, 'house_infl': 5.0,
-    'target_sqft': 1000, 'market_rate_psf': 0,
+    'target_sqft': 1000,
     'tx_cost': 7.0, 'cash_buf': 1000000, 'buf_infl': 6.0, 'income_0': 100000,
     'net_0': 80000, 'inc_growth': 8.0, 'tax_regime': "new", 'basic_m': 50000,
     'hra_m': 20000, 'metro': True, 'bonus_0': 0, 'bonus_mode': 'fixed',
@@ -509,9 +509,8 @@ def run_affordability(params, asset_classes, reinvest_rules, rebalance_events):
         affordable = cond_finance and cond_liquidity and cond_emi
 
         sqft = params.get('target_sqft', 0)
-        aff_psf = (h_t / sqft) if sqft > 0 else 0.0
-        mkt_rate_today = params.get('market_rate_psf', 0)
-        mkt_psf = (mkt_rate_today * ((1 + params['house_infl']) ** t)) if mkt_rate_today > 0 else 0.0
+        psf = (h_t / sqft) if sqft > 0 else 0.0
+        aff_sqft = (v_t / psf) if psf > 0 else 0.0
 
         res.append({
             'Age': age, 'TakeHome/mo': ps['take_home_monthly'], 'Surplus/yr': ps['surplus_yr'],
@@ -520,8 +519,7 @@ def run_affordability(params, asset_classes, reinvest_rules, rebalance_events):
             'Tax%': ps['tax_info']['effective_rate'] * 100,
             'Eff_Return%': ps['eff_return_rate'] * 100,
             'Affordable': "YES ✓" if affordable else "No",
-            'Aff_PSF': aff_psf, 'Mkt_PSF': mkt_psf,
-            'PSF_Gap': (mkt_psf - aff_psf) if mkt_psf > 0 else 0.0,
+            'Aff_Sqft': aff_sqft,
             'Portfolio_Breakdown': ps['Portfolio_Breakdown']
         })
 
@@ -627,17 +625,11 @@ with tab1:
             st.number_input("Buffer Inflation (%)", key="buf_infl",
                             help="Annual growth of your required cash buffer.")
 
-        section_header("📐", "Price per Sq Ft Analysis")
-        st.caption("Optional — fill in to see ₹/sq ft columns in the results table and chart.")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.number_input("Target Carpet Area (sq ft)", min_value=0, step=50,
-                            key="target_sqft",
-                            help="Size of the home you want to buy. Used to derive affordable ₹/sq ft from the house price.")
-        with c2:
-            st.number_input("Current Market Rate (₹/sq ft)  [0 = skip]", min_value=0, step=500,
-                            key="market_rate_psf",
-                            help="Today's prevailing rate per sq ft in your target area. The simulator inflates this at the same rate as house price inflation to show market ₹/sq ft each year.")
+        section_header("📐", "Sq Ft Affordability")
+        st.caption("Optional — enter a market rate to see how many sq ft you can afford each year.")
+        st.number_input("Market Rate Today (₹/sq ft)", min_value=0, step=500,
+                        key="target_sqft",
+                        help="Current price per sq ft in your target area. The simulator projects this forward with house price inflation and divides your affordable outlay by it each year to show how many sq ft you can buy.")
 
 # ─────────────────────────────────────────────
 # TAB 2 — Income & Expenses
@@ -878,8 +870,7 @@ with tab4:
         'emi_fixed': st.session_state.emi_fixed,
         'emi_buf': st.session_state.emi_buf / 100.0,
         'user_max_loan': st.session_state.user_max_loan,
-        'target_sqft': st.session_state.target_sqft,
-        'market_rate_psf': st.session_state.market_rate_psf
+        'target_sqft': st.session_state.target_sqft
     }
 
     col_btn, col_spacer = st.columns([1, 3])
@@ -899,11 +890,10 @@ with tab4:
         affordable_rows = df_res[df_res['Affordable'] == "YES ✓"]
 
         # ── Result Banner ──
-        show_psf = st.session_state.target_sqft > 0
+        show_sqft = st.session_state.target_sqft > 0
         if not affordable_rows.empty:
             first = affordable_rows.iloc[0]
-            psf_extra = f" &nbsp;·&nbsp; Aff. ₹/sq ft: ₹{first['Aff_PSF']:,.0f}" if show_psf else ""
-            mkt_extra = f" &nbsp;·&nbsp; Market ₹/sq ft: ₹{first['Mkt_PSF']:,.0f}" if (show_psf and st.session_state.market_rate_psf > 0) else ""
+            sqft_extra = f" &nbsp;·&nbsp; Aff. Area: {first['Aff_Sqft']:,.0f} sq ft" if show_sqft else ""
             st.markdown(f"""
             <div class="result-banner success">
                 <div class="emoji">🎉</div>
@@ -913,7 +903,7 @@ with tab4:
                         Portfolio: ₹{first['Portfolio']:,.0f} &nbsp;·&nbsp;
                         House Price: ₹{first['HousePrice']:,.0f} &nbsp;·&nbsp;
                         Max Loan: ₹{first['MaxLoan']:,.0f} &nbsp;·&nbsp;
-                        EMI: ₹{first['EffEMI']:,.0f}/mo{psf_extra}{mkt_extra}
+                        EMI: ₹{first['EffEMI']:,.0f}/mo{sqft_extra}
                     </div>
                 </div>
             </div>
@@ -935,18 +925,6 @@ with tab4:
         final_house = last['HousePrice']
         final_portfolio = last['Portfolio']
         final_surplus = last['Surplus/yr']
-        final_aff_psf = last['Aff_PSF']
-        final_mkt_psf = last['Mkt_PSF']
-
-        psf_card = ""
-        if show_psf:
-            psf_delta = f"market: ₹{final_mkt_psf:,.0f}/sq ft" if st.session_state.market_rate_psf > 0 else f"for {st.session_state.target_sqft} sq ft"
-            psf_card = f"""
-            <div class="metric-card blue">
-                <div class="label">Aff. ₹/sq ft (Age {st.session_state.max_age})</div>
-                <div class="value">₹{final_aff_psf:,.0f}</div>
-                <div class="delta">{psf_delta}</div>
-            </div>"""
 
         st.markdown(f"""
         <div class="metric-row">
@@ -970,7 +948,6 @@ with tab4:
                 <div class="value">{len(affordable_rows)}</div>
                 <div class="delta">years out of {years_span + 1}</div>
             </div>
-            {psf_card}
         </div>
         """, unsafe_allow_html=True)
 
@@ -980,19 +957,6 @@ with tab4:
         chart_df = chart_df.rename(columns={'Portfolio': 'Portfolio Value', 'HousePrice': 'House Price (incl. costs)'})
         chart_df = chart_df.set_index('Age')
         st.line_chart(chart_df, use_container_width=True, height=260)
-
-        # ── Chart 2: PSF (only when target_sqft provided) ──
-        if show_psf:
-            section_header("📐", "Affordable ₹/sq ft Over Time")
-            psf_chart_df = df_res[['Age', 'Aff_PSF']].copy()
-            psf_chart_df = psf_chart_df.rename(columns={'Aff_PSF': 'Affordable ₹/sq ft'})
-            if st.session_state.market_rate_psf > 0:
-                psf_chart_df['Market ₹/sq ft'] = df_res['Mkt_PSF']
-            psf_chart_df = psf_chart_df.set_index('Age')
-            st.line_chart(psf_chart_df, use_container_width=True, height=240)
-            st.caption("Affordable ₹/sq ft = projected house price ÷ your target area. "
-                       "Market ₹/sq ft = today's market rate inflated at the same house price inflation rate. "
-                       "When the Affordable line crosses the Market line, you can afford the current market rate.")
 
         # ── Warnings ──
         if over_details:
@@ -1029,13 +993,6 @@ with tab4:
                 return 'background-color: rgba(34,197,94,0.15); color: #166534; font-weight: 700;'
             return 'color: #64748b;'
 
-        def color_psf_gap(val):
-            if val > 0:
-                return 'color: #991b1b; font-weight: 600;'   # gap still exists — red
-            elif val < 0:
-                return 'color: #166534; font-weight: 600;'   # affordable is cheaper than market — green
-            return ''
-
         format_dict = {
             'TakeHome/mo': '₹{:,.0f}', 'Surplus/yr': '₹{:,.0f}',
             'Portfolio': '₹{:,.0f}', 'HousePrice': '₹{:,.0f}',
@@ -1043,30 +1000,13 @@ with tab4:
             'EffEMI': '₹{:,.0f}', 'AffEMI': '₹{:,.0f}',
             'Tax%': '{:.1f}%', 'Eff_Return%': '{:.1f}%',
         }
+        if show_sqft:
+            format_dict['Aff_Sqft'] = '{:,.0f} sq ft'
 
-        # Add psf formats only when the column has meaningful data
-        if show_psf:
-            format_dict['Aff_PSF'] = '₹{:,.0f}'
-        if show_psf and st.session_state.market_rate_psf > 0:
-            format_dict['Mkt_PSF'] = '₹{:,.0f}'
-            format_dict['PSF_Gap'] = '₹{:,.0f}'
-
-        styled = df_res.style.format(format_dict).map(color_affordable, subset=['Affordable'])
-        if show_psf and st.session_state.market_rate_psf > 0:
-            styled = styled.map(color_psf_gap, subset=['PSF_Gap'])
-
-        # Columns to hide when sqft not filled in
-        cols_to_hide = []
-        if not show_psf:
-            cols_to_hide += ['Aff_PSF', 'Mkt_PSF', 'PSF_Gap']
-        elif st.session_state.market_rate_psf == 0:
-            cols_to_hide += ['Mkt_PSF', 'PSF_Gap']
-
-        display_df = df_res.drop(columns=cols_to_hide, errors='ignore')
-        display_styled = display_df.style.format({k: v for k, v in format_dict.items() if k in display_df.columns})
-        display_styled = display_styled.map(color_affordable, subset=['Affordable'])
-        if show_psf and st.session_state.market_rate_psf > 0 and 'PSF_Gap' in display_df.columns:
-            display_styled = display_styled.map(color_psf_gap, subset=['PSF_Gap'])
+        display_df = df_res if show_sqft else df_res.drop(columns=['Aff_Sqft'], errors='ignore')
+        display_styled = (display_df.style
+                          .format({k: v for k, v in format_dict.items() if k in display_df.columns})
+                          .map(color_affordable, subset=['Affordable']))
 
         st.dataframe(
             display_styled,
@@ -1078,20 +1018,10 @@ with tab4:
                     help="Asset balances post-rebalancing for this year.",
                     width="large"
                 ),
-                "Aff_PSF": st.column_config.NumberColumn(
-                    "Aff. ₹/sq ft",
-                    help="House price projected to this year ÷ your target carpet area.",
-                    format="₹%d"
-                ),
-                "Mkt_PSF": st.column_config.NumberColumn(
-                    "Market ₹/sq ft",
-                    help="Today's market rate inflated at house price inflation rate.",
-                    format="₹%d"
-                ),
-                "PSF_Gap": st.column_config.NumberColumn(
-                    "Gap ₹/sq ft",
-                    help="Market ₹/sq ft minus Affordable ₹/sq ft. Negative = you can beat the market.",
-                    format="₹%d"
+                "Aff_Sqft": st.column_config.NumberColumn(
+                    "Affordable Sq Ft",
+                    help="Total carpet area you could buy at this year's market rate with your projected portfolio + loan.",
+                    format="%d sq ft"
                 ),
             }
         )
