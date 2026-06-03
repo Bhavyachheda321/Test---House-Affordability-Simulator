@@ -192,8 +192,8 @@ REBALANCE_COLS = [
 ]
 if 'rebalance_table' not in st.session_state:
     st.session_state['rebalance_table'] = pd.DataFrame(columns=REBALANCE_COLS)
-else:
-    # migrate old schema that only had Year/Source/Destination/Transfer_Type/Value
+elif not st.session_state.get('_rb_loaded_from_file', False):
+    # On first run only: migrate old schema (Year column) to new schema
     existing = st.session_state['rebalance_table']
     if 'Trigger_Type' not in existing.columns:
         new_rb = pd.DataFrame(columns=REBALANCE_COLS)
@@ -215,26 +215,109 @@ if 'sim_results' not in st.session_state:
     st.session_state['sim_results'] = None
 
 
+def _sanitise_value(v):
+    """Convert NaN/Infinity strings and floats to None for JSON safety."""
+    import math
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    return v
+
+def _sanitise_record(rec):
+    """Recursively sanitise a dict record."""
+    return {k: _sanitise_value(v) for k, v in rec.items()}
+
+def _migrate_rebalance(rb_raw):
+    """
+    Accept either old schema (Year, Source_Asset, ...) or new schema
+    (Trigger_Type, Start_Age, ...) and always return a DataFrame with
+    the new REBALANCE_COLS schema.
+    """
+    if not rb_raw:
+        return pd.DataFrame(columns=REBALANCE_COLS)
+    rb = pd.DataFrame([_sanitise_record(r) for r in rb_raw])
+    if 'Trigger_Type' in rb.columns:
+        # Already new schema — ensure all columns present
+        for col in REBALANCE_COLS:
+            if col not in rb.columns:
+                rb[col] = None
+        return rb[REBALANCE_COLS]
+    # Old schema: has 'Year' column
+    rows = []
+    for _, row in rb.iterrows():
+        rows.append({
+            "Trigger_Type": "One-Time",
+            "Source_Asset": row.get("Source_Asset", ""),
+            "Destination_Asset": row.get("Destination_Asset", ""),
+            "Transfer_Type": row.get("Transfer_Type", "Percentage"),
+            "Value": row.get("Value", 0),
+            "Start_Age": row.get("Year", None),
+            "End_Age": None,
+            "Frequency_Years": None,
+            "Threshold_Asset": None,
+            "Threshold_Amount": None,
+        })
+    return pd.DataFrame(rows, columns=REBALANCE_COLS)
+
+
 def handle_scenario_upload():
     f = st.session_state.get("scenario_uploader")
-    if f is not None:
-        try:
-            data = json.load(f)
-            for k, v in data.get("params", {}).items():
-                if k in st.session_state:
-                    st.session_state[k] = v
-            if "assets" in data:
-                st.session_state['assets_table'] = pd.DataFrame(data["assets"])
-            if "reinvest_rules" in data:
-                st.session_state['reinvest_table'] = pd.DataFrame(data["reinvest_rules"])
-            if "rebalance_events" in data:
-                rb = pd.DataFrame(data["rebalance_events"])
-                if 'Trigger_Type' not in rb.columns:
-                    rb = pd.DataFrame(columns=REBALANCE_COLS)
-                st.session_state['rebalance_table'] = rb
-            st.success("✅ Scenario loaded successfully!")
-        except Exception as e:
-            st.error(f"Error loading scenario: {e}")
+    if f is None:
+        return
+    try:
+        # Read raw bytes and replace NaN tokens (invalid JSON) with null
+        raw = f.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        # Replace bare NaN (Python/JS artifact) with null for valid JSON
+        import re as _re
+        raw = _re.sub(r'\bNaN\b', 'null', raw)
+        data = json.loads(raw)
+
+        # Restore scalar params
+        for k, v in data.get("params", {}).items():
+            if k in default_params:
+                # Type-coerce to match expected type
+                expected = type(default_params[k])
+                try:
+                    if v is None:
+                        st.session_state[k] = default_params[k]
+                    elif expected == bool:
+                        st.session_state[k] = bool(v)
+                    elif expected == int:
+                        st.session_state[k] = int(float(v))
+                    elif expected == float:
+                        st.session_state[k] = float(v)
+                    else:
+                        st.session_state[k] = v
+                except (TypeError, ValueError):
+                    st.session_state[k] = default_params[k]
+
+        # Restore assets table — sanitise NaN cells
+        if "assets" in data:
+            records = [_sanitise_record(r) for r in data["assets"]]
+            df = pd.DataFrame(records)
+            # Ensure boolean column is proper bool not None
+            if "Invest_above_Surplus_Cash" in df.columns:
+                df["Invest_above_Surplus_Cash"] = df["Invest_above_Surplus_Cash"].fillna(False).astype(bool)
+            st.session_state["assets_table"] = df
+
+        # Restore reinvest rules
+        if "reinvest_rules" in data:
+            records = [_sanitise_record(r) for r in data["reinvest_rules"]]
+            st.session_state["reinvest_table"] = pd.DataFrame(records) if records else \
+                pd.DataFrame(columns=["Source_Asset","Destination_Asset","Allocation_Pct"])
+
+        # Restore rebalance events — handles both old and new schema
+        if "rebalance_events" in data:
+            st.session_state["rebalance_table"] = _migrate_rebalance(data["rebalance_events"])
+
+        # Mark migration as done so startup block doesn't wipe it
+        st.session_state["_rb_loaded_from_file"] = True
+        st.session_state["sim_results"] = None  # clear stale results
+        st.success("✅ Scenario loaded! All tabs repopulated.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Error loading scenario: {e}")
 
 
 def go_to_tab(n):
@@ -705,41 +788,43 @@ st.markdown('</div>', unsafe_allow_html=True)
 # =============================================================================
 # TABS — shown prominently right below hero
 # =============================================================================
-# ── Manual tab bar (so Next/Prev buttons actually work) ──
-TAB_LABELS = [
-    ("👤", "Personal & Housing"),
-    ("💰", "Income & Expenses"),
-    ("📈", "Assets & Loan"),
-    ("📊", "Results"),
-]
+# ── Tabs — use st.tabs() so ALL tab content stays in DOM ──
+# This is critical: if/elif hides inactive tabs causing Streamlit
+# to reset their widget state on every rerun. st.tabs() renders
+# all panels and keeps session_state intact across tab switches.
+# Nav buttons work by injecting JS to click the correct tab button.
+
 _at = st.session_state.get('active_tab', 0)
 
-tab_cols = st.columns(len(TAB_LABELS))
-for _i, (_icon, _label) in enumerate(TAB_LABELS):
-    with tab_cols[_i]:
-        _is_active = (_i == _at)
-        _btn_style = (
-            "background:linear-gradient(135deg,#1d6fce,#2d4a9e);color:#fff;border:none;"
-            "border-radius:8px;padding:.55rem 1rem;font-weight:700;font-size:.85rem;"
-            "width:100%;cursor:pointer;box-shadow:0 2px 6px rgba(29,111,206,.3);"
-        ) if _is_active else (
-            "background:#fff;color:#334155;border:1.5px solid #d1dbe8;"
-            "border-radius:8px;padding:.55rem 1rem;font-weight:600;font-size:.85rem;"
-            "width:100%;cursor:pointer;"
-        )
-        if st.button(f"{_icon}  {_label}", key=f"tab_btn_{_i}",
-                     use_container_width=True,
-                     type="primary" if _is_active else "secondary"):
-            st.session_state['active_tab'] = _i
-            st.rerun()
+# Inject JS to click the right tab whenever active_tab changes
+st.markdown(f"""
+<script>
+(function() {{
+    const target = {_at};
+    function clickTab() {{
+        const buttons = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
+        if (buttons.length > target) {{
+            buttons[target].click();
+        }} else {{
+            setTimeout(clickTab, 100);
+        }}
+    }}
+    clickTab();
+}})();
+</script>
+""", unsafe_allow_html=True)
 
-st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
-_at = st.session_state.get('active_tab', 0)  # re-read after potential rerun
+tab1, tab2, tab3, tab4 = st.tabs([
+    "👤  Personal & Housing",
+    "💰  Income & Expenses",
+    "📈  Assets & Loan",
+    "📊  Results"
+])
 
 # ─────────────────────────────────────────────
 # TAB 1
 # ─────────────────────────────────────────────
-if _at == 0:
+with tab1:
     tip("Start here. Tell the simulator <strong>who you are</strong> and <strong>what home you want to buy</strong>.")
     col1, col2 = st.columns(2, gap="large")
 
@@ -785,7 +870,7 @@ if _at == 0:
 # ─────────────────────────────────────────────
 # TAB 2
 # ─────────────────────────────────────────────
-elif _at == 1:
+with tab2:
     tip("Tell the simulator how much you <strong>earn, spend, and save</strong> each month.")
     col1, col2 = st.columns(2, gap="large")
 
@@ -869,7 +954,7 @@ elif _at == 1:
 # ─────────────────────────────────────────────
 # TAB 3
 # ─────────────────────────────────────────────
-elif _at == 2:
+with tab3:
     tip("Define your <strong>current investments</strong>, how they grow, rebalancing rules, and home loan eligibility.")
 
     section_header("📂", "Investment Accounts / Assets")
@@ -1019,7 +1104,7 @@ elif _at == 2:
 # ─────────────────────────────────────────────
 # TAB 4 — Results
 # ─────────────────────────────────────────────
-elif _at == 3:
+with tab4:
     tip("Click <strong>▶ Run Simulation</strong> to get your year-by-year forecast and earliest affordable age.")
 
     # Validation
